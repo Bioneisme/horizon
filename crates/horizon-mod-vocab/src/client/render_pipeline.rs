@@ -19,7 +19,7 @@ pub struct RenderPipeline {
     pub vertex_format: PipelineVertexFormat,
     /// How the shader's result joins the frame.
     pub blend: PipelineBlend,
-    /// Whether nearer world surfaces hide the draw. No pipeline writes depth.
+    /// Whether nearer world surfaces hide the draw.
     pub depth: WorldDepth,
     /// Whether a resource load may go on without this pipeline (NeoForge's
     /// `registerOptionalPipeline`). A required pipeline (NeoForge's `registerPipeline`, the
@@ -35,6 +35,9 @@ pub struct RenderPipeline {
     /// The buffers of the mod's own data the shader reads, in the order registered
     /// ([`Self::reads_buffer`]).
     pub buffers: Vec<PipelineBuffer>,
+    /// Whether the draw writes the depth of the surface its shader returns
+    /// ([`Self::writes_depth`]).
+    pub depth_write: bool,
 }
 impl RenderPipeline {
     /// Describe a required pipeline that draws [`PipelineVertexFormat::PositionTexColor`]
@@ -56,6 +59,7 @@ impl RenderPipeline {
             texture: None,
             scene_depth: false,
             buffers: Vec::new(),
+            depth_write: false,
         }
     }
     /// The owning mod, assigned by the host after registration.
@@ -101,6 +105,17 @@ impl RenderPipeline {
     /// `pipeline_` or `Pipeline`). A registration past these is logged and dropped.
     pub fn reads_buffer(mut self, name: &str, size: u32) -> Self {
         self.buffers.push(PipelineBuffer::new(name, size));
+        self
+    }
+
+    /// Let the draw write depth, as solid geometry does: the shader returns a `PipelineSurface`,
+    /// its colour and the point it found in blocks relative to the camera, and the game writes
+    /// that point's depth, so what draws after it (entities, translucent terrain, particles) is
+    /// hidden behind it or blends over it. For surfaces a shader traces or generates itself. A
+    /// point behind the camera, or not finite, draws nothing. Only with [`WorldDepth::Tested`]:
+    /// a registration drawing through walls is logged and dropped.
+    pub fn writes_depth(mut self) -> Self {
+        self.depth_write = true;
         self
     }
 }
@@ -347,13 +362,17 @@ fn validate_in(
         } else if pipelines.iter().any(|kept| kept.id == pipeline.id) {
             Some("an earlier registration has that id")
         } else {
-            let held = pipelines
+            let held: u64 = pipelines
                 .iter()
                 .filter(|kept| kept.owner == owner)
                 .flat_map(|kept| &kept.buffers)
                 .map(|b| u64::from(b.size))
                 .sum();
-            buffers_refusal(&pipeline, held)
+            if pipeline.depth_write && pipeline.depth == WorldDepth::ThroughWalls {
+                Some("it writes depth but draws through walls")
+            } else {
+                buffers_refusal(&pipeline, held)
+            }
         };
         match refusal {
             Some(reason) => log::warn!(
@@ -409,6 +428,23 @@ mod tests {
         pipelines.push(pipeline("shared:glow"));
         validate_in("late", &previous, &mut pipelines, &|_| true);
         assert_eq!(pipelines, previous);
+    }
+
+    /// A pipeline that writes depth tests it: one registered to draw through walls is refused.
+    #[test]
+    fn a_depth_writing_pipeline_must_test_depth() {
+        let through = |id: &str| {
+            let id = Identifier::parse(id).unwrap();
+            RenderPipeline::new(id.clone(), id, PipelineBlend::Translucent, WorldDepth::ThroughWalls)
+        };
+        let mut pipelines = vec![
+            pipeline("mine:surface").writes_depth(),
+            through("mine:walls").writes_depth(),
+            through("mine:plain"),
+        ];
+        validate_in("mine", &[], &mut pipelines, &|_| true);
+        assert_eq!(ids(&pipelines), ["mine:surface", "mine:plain"]);
+        assert!(pipelines[0].depth_write);
     }
 
     /// A pipeline's buffers are refused with the pipeline unless each is 16 bytes to 16 MiB in

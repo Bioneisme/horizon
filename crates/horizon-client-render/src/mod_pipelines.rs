@@ -120,7 +120,19 @@ pub fn repeat_texel(uv: [f32; 2], rect: [f32; 4], size: [u32; 2]) -> [u32; 2] {
     })
 }
 
-/// The entry points, after the pipeline's file: the vertex stage, and a fragment stage that
+/// What a depth-writing pipeline's file can use as well ([`RenderPipeline::writes_depth`]): what
+/// its `pipeline_fragment` returns.
+const SURFACE_PRELUDE: &str = "\
+// What a depth-writing pipeline's `pipeline_fragment` found at this fragment.
+struct PipelineSurface {
+    // Its colour in linear light; alpha is coverage.
+    color: vec4<f32>,
+    // Where it is, in blocks relative to the camera: the game writes this point's depth.
+    position: vec3<f32>,
+}
+";
+
+/// The entry points, after the pipeline's file: the vertex stage here, then a fragment stage that
 /// hands the mod linear light and stores its answer as the frame holds colour.
 const ENTRIES: &str = "
 struct HorizonPipelineVertex {
@@ -141,12 +153,49 @@ struct HorizonPipelineVertex {
     out.screen = out.clip;
     return out;
 }
+";
+
+/// The fragment stage of a pipeline that writes no depth.
+const COLOR_ENTRIES: &str = "
 @fragment fn horizon_fs_pipeline(in: HorizonPipelineVertex, @builtin(front_facing) front: bool)
     -> @location(0) vec4<f32> {
-    let input = PipelineInput(in.uv, horizon_decode_rgba(in.color), in.position, in.clip.xy,
+    let result = pipeline_fragment(horizon_pipeline_input(in, front));
+    return horizon_pipeline_color(result);
+}
+";
+
+/// The fragment stage of a depth-writing pipeline ([`RenderPipeline::writes_depth`]), in place of
+/// [`COLOR_ENTRIES`]: the surface's colour as that one stores it, at the depth of its point as the
+/// world's jittered view projects it.
+const DEPTH_ENTRIES: &str = "
+struct HorizonPipelineOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+@fragment fn horizon_fs_pipeline(in: HorizonPipelineVertex, @builtin(front_facing) front: bool)
+    -> HorizonPipelineOutput {
+    let surface = pipeline_fragment(horizon_pipeline_input(in, front));
+    let clip = horizon_pipeline_view * vec4<f32>(surface.position, 1.0);
+    let depth = clip.z / clip.w;
+    // Behind the camera, past the near plane or not a number: nothing (NaN fails every test).
+    if !(clip.w > 0.0) || !(depth >= 0.0) || !(depth <= 1.0) {
+        discard;
+    }
+    var out: HorizonPipelineOutput;
+    out.color = horizon_pipeline_color(surface.color);
+    out.depth = depth;
+    return out;
+}
+";
+
+/// What both fragment stages share, after the vertex stage.
+const FRAGMENT_HELPERS: &str = "
+fn horizon_pipeline_input(in: HorizonPipelineVertex, front: bool) -> PipelineInput {
+    return PipelineInput(in.uv, horizon_decode_rgba(in.color), in.position, in.clip.xy,
         in.screen.xy / in.screen.w, front);
-    let result = pipeline_fragment(input);
-    // Coverage only: no light rides in the frame's alpha, and NaN covers nothing.
+}
+// Coverage only: no light rides in the frame's alpha, and NaN covers nothing.
+fn horizon_pipeline_color(result: vec4<f32>) -> vec4<f32> {
     let coverage = clamp(select(0.0, result.a, result.a > 0.0), 0.0, 1.0);
     return vec4<f32>(horizon_encode(result.rgb), coverage);
 }
@@ -191,6 +240,8 @@ pub struct Built {
     /// The sizes of the buffers it reads, in bytes, in the order registered
     /// ([`RenderPipeline::reads_buffer`]).
     pub buffers: Vec<u32>,
+    /// Whether it writes the depth of its surface ([`RenderPipeline::writes_depth`]).
+    pub depth_write: bool,
 }
 
 /// What a pipeline's shader binds beyond group 0, as its registration asks.
@@ -203,6 +254,9 @@ pub struct Features<'a> {
     /// The mod's buffers, in group 2 from [`FIRST_BUFFER_BINDING`] on
     /// ([`RenderPipeline::reads_buffer`]).
     pub buffers: &'a [PipelineBuffer],
+    /// Its function returns a `PipelineSurface` whose depth is written
+    /// ([`RenderPipeline::writes_depth`]).
+    pub depth_write: bool,
 }
 
 /// Group 2's binding of a pipeline's first buffer, after a texture's three.
@@ -215,6 +269,7 @@ impl<'a> Features<'a> {
             textured: pipeline.texture.is_some(),
             scene_depth: pipeline.scene_depth,
             buffers: &pipeline.buffers,
+            depth_write: pipeline.depth_write,
         }
     }
 
@@ -307,6 +362,7 @@ impl Pipelines {
                         texture,
                         scene_depth: pipeline.scene_depth,
                         buffers: pipeline.buffers.iter().map(|b| b.size).collect(),
+                        depth_write: pipeline.depth_write,
                     }),
                     Err(reason) => {
                         let refusal = format!(
@@ -445,7 +501,12 @@ pub fn texture_refusal(cause: PipelineTextureError) -> String {
 /// The prelude a pipeline's file follows.
 fn prelude(features: Features) -> String {
     format!(
-        "{PRELUDE_TYPES}{}{}{}{}",
+        "{PRELUDE_TYPES}{}{}{}{}{}",
+        if features.depth_write {
+            SURFACE_PRELUDE
+        } else {
+            ""
+        },
         if features.textured {
             TEXTURE_PRELUDE
         } else {
@@ -501,6 +562,9 @@ pub fn compose_with(text: &str, features: Features) -> Result<String, String> {
         if !features.scene_depth && text.contains("pipeline_scene_") {
             message += " (the scene depth functions need RenderPipeline::reads_scene_depth)";
         }
+        if !features.depth_write && text.contains("PipelineSurface") {
+            message += " (a PipelineSurface is returned by RenderPipeline::writes_depth pipelines)";
+        }
         located(at, message)
     })?;
     for (_, function) in module.functions.iter() {
@@ -512,7 +576,7 @@ pub fn compose_with(text: &str, features: Features) -> Result<String, String> {
     if !module.overrides.is_empty() {
         return Err("override declarations are not supported".into());
     }
-    signature(&module)?;
+    signature(&module, features.depth_write)?;
     if !module.entry_points.is_empty() {
         return Err("it declares an entry point; the game supplies both stages".into());
     }
@@ -526,6 +590,12 @@ pub fn compose_with(text: &str, features: Features) -> Result<String, String> {
         return Err("it declares a binding; a pipeline reads only `frame` and its input".into());
     }
     shader.push_str(ENTRIES);
+    shader.push_str(FRAGMENT_HELPERS);
+    shader.push_str(if features.depth_write {
+        DEPTH_ENTRIES
+    } else {
+        COLOR_ENTRIES
+    });
     let module = naga::front::wgsl::parse_str(&shader).map_err(|e| e.message().to_owned())?;
     Validator::new(ValidationFlags::all(), Capabilities::default())
         .validate(&module)
@@ -546,9 +616,15 @@ pub fn compose_with(text: &str, features: Features) -> Result<String, String> {
     Ok(shader)
 }
 
-/// `fn pipeline_fragment(input: PipelineInput) -> vec4<f32>`, or what the file has instead.
-fn signature(module: &naga::Module) -> Result<(), String> {
-    let expected = format!("expected `fn {FUNCTION}(input: PipelineInput) -> vec4<f32>`");
+/// `fn pipeline_fragment(input: PipelineInput) -> vec4<f32>`, or `-> PipelineSurface` for a
+/// pipeline that writes depth, or what the file has instead.
+fn signature(module: &naga::Module, depth_write: bool) -> Result<(), String> {
+    let returns = if depth_write {
+        "PipelineSurface"
+    } else {
+        "vec4<f32>"
+    };
+    let expected = format!("expected `fn {FUNCTION}(input: PipelineInput) -> {returns}`");
     let (_, function) = module
         .functions
         .iter()
@@ -559,13 +635,18 @@ fn signature(module: &naga::Module) -> Result<(), String> {
         [argument] if module.types[argument.ty].name.as_deref() == Some("PipelineInput")
     );
     let returns_color = function.result.as_ref().is_some_and(|result| {
-        matches!(
-            module.types[result.ty].inner,
-            naga::TypeInner::Vector {
-                size: naga::VectorSize::Quad,
-                scalar: naga::Scalar::F32,
-            }
-        )
+        let ty = &module.types[result.ty];
+        if depth_write {
+            ty.name.as_deref() == Some("PipelineSurface")
+        } else {
+            matches!(
+                ty.inner,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Quad,
+                    scalar: naga::Scalar::F32,
+                }
+            )
+        }
     });
     if takes_input && returns_color {
         Ok(())
@@ -774,6 +855,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
         textured: true,
         scene_depth: false,
         buffers: &[],
+        depth_write: false,
     };
 
     #[test]
@@ -804,6 +886,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
         textured: false,
         scene_depth: true,
         buffers: &[],
+        depth_write: false,
     };
 
     /// A pipeline registered with `reads_scene_depth` can call the scene depth functions and
@@ -824,6 +907,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
             textured: true,
             scene_depth: true,
             buffers: &[],
+            depth_write: false,
         };
         assert!(compose_with(both, textured_and_depth).is_ok());
         let own = format!("@group(1) @binding(2) var<uniform> mine: f32;\n{DEPTH}");
@@ -845,6 +929,39 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
             glow.built()[0].as_ref().unwrap().scene_depth,
             "the registration decides, not the file"
         );
+    }
+
+    /// A pipeline registered with `writes_depth` returns its surface, a colour and where it is,
+    /// and its fragment stage writes that point's depth; any other pipeline is told what to
+    /// register, and a depth-writing one that returns a colour is told what to return.
+    #[test]
+    fn a_depth_writing_pipeline_returns_its_surface() {
+        let surface = "fn pipeline_fragment(input: PipelineInput) -> PipelineSurface {
+    return PipelineSurface(input.color, input.position * 1.5);
+}";
+        let writes = Features {
+            depth_write: true,
+            ..Features::default()
+        };
+        let shader = compose_with(surface, writes).unwrap();
+        assert!(shader.contains("@builtin(frag_depth)"));
+        assert!(
+            compose(surface)
+                .unwrap_err()
+                .contains("RenderPipeline::writes_depth"),
+            "{:?}",
+            compose(surface)
+        );
+        assert!(
+            compose_with(GLOW, writes)
+                .unwrap_err()
+                .contains("PipelineSurface")
+        );
+        assert!(!compose(GLOW).unwrap().contains("frag_depth"));
+
+        let registered = [pipeline("example:surface", "example:surface").writes_depth()];
+        let set = Pipelines::build(&registered, 1, |_| Ok(surface.to_owned())).unwrap();
+        assert!(set.built()[0].as_ref().unwrap().depth_write);
     }
 
     /// A pipeline reads its buffers by the names it registered them with, as arrays of

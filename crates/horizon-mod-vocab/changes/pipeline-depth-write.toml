@@ -1,0 +1,7 @@
+ids = [
+    "type:RenderPipeline",
+    "handle:RenderPipeline::writes_depth",
+    "method:Hooks::register_render_pipelines",
+]
+why = "A mod render pipeline can write depth (RenderPipeline::writes_depth, with WorldDepth::Tested): its pipeline_fragment returns a PipelineSurface, a colour and the point it found relative to the camera, and the game writes that point's depth as the world's jittered view projects it, so later draws are hidden behind it. RenderPipeline gains depth_write, so its wire layout changes for wasm mods."
+migrate = "Pipelines that don't write depth are unchanged; RenderPipeline::new leaves depth_write false. Rebuild wasm mods against this SDK for the changed RenderPipeline wire layout."

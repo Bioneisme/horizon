@@ -210,7 +210,8 @@ impl ModPipelines {
         let group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mod pipelines"),
             entries: &[
-                uniform(0, wgpu::ShaderStages::VERTEX),
+                // A depth-writing pipeline's fragment stage projects its surface's point too.
+                uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 uniform(1, wgpu::ShaderStages::FRAGMENT),
             ],
         });
@@ -365,10 +366,11 @@ impl ModPipelines {
                 cull_mode: None,
                 ..Default::default()
             },
-            // No depth is written. Reversed depth: nearer is greater.
+            // Depth is written only by a pipeline that writes its surface's. Reversed depth:
+            // nearer is greater.
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
+                depth_write_enabled: Some(built.depth_write),
                 depth_compare: Some(match built.depth {
                     WorldDepth::ThroughWalls => wgpu::CompareFunction::Always,
                     _ => wgpu::CompareFunction::GreaterEqual,
@@ -2007,6 +2009,91 @@ mod tests {
             [0.0, 0.0, 255.0, 255.0],
             0.0,
             "kept in a new renderer",
+        );
+    }
+
+    /// A depth-writing pipeline's surface hides what draws behind it afterwards, at the depth of
+    /// the point it returned rather than its quad's: a quad between that point and the wall is
+    /// hidden, one in front of it is drawn.
+    #[test]
+    fn a_depth_writing_pipeline_hides_what_draws_behind_its_surface() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        // Blue, on a surface 3 blocks ahead behind a quad 2 ahead.
+        let surface = "fn pipeline_fragment(input: PipelineInput) -> PipelineSurface {
+    return PipelineSurface(vec4<f32>(0.0, 0.0, 1.0, 1.0), input.position * 1.5);
+}";
+        let id = |name: &str| Identifier::parse(name).unwrap();
+        let registered = [
+            RenderPipeline::new(
+                id("test:surface"),
+                id("test:surface"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            )
+            .writes_depth(),
+            RenderPipeline::new(
+                id("test:plain"),
+                id("test:plain"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            ),
+        ];
+        let set = Pipelines::build(&registered, 4, |file| {
+            Ok(if file.ends_with("surface.wgsl") {
+                surface
+            } else {
+                PASS
+            }
+            .to_owned())
+        })
+        .unwrap();
+        let red = [255, 0, 0, 255];
+        let vertices = [
+            quad([0.0, 0.0, 64.0, 64.0], 2.0, [255; 4]),
+            // Behind the surface (and in front of the wall 5 ahead), just behind it, just in front.
+            quad([0.0, 0.0, 21.0, 64.0], 4.0, red),
+            quad([21.0, 0.0, 42.0, 64.0], 3.1, red),
+            quad([42.0, 0.0, 64.0, 64.0], 2.9, red),
+        ]
+        .concat();
+        let runs = [
+            PipelineRun {
+                slot: 0,
+                stage: 4,
+                quads: 1,
+            },
+            PipelineRun {
+                slot: 1,
+                stage: 4,
+                quads: 3,
+            },
+        ];
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            ..Default::default()
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        let (blue, red) = ([0.0, 0.0, 255.0, 255.0], [255.0, 0.0, 0.0, 255.0]);
+        assert_near(at(10, 32), blue, 0.0, "behind the surface: hidden");
+        assert_near(
+            at(31, 32),
+            blue,
+            0.0,
+            "a tenth of a block behind it: hidden",
+        );
+        assert_near(
+            at(53, 32),
+            red,
+            0.0,
+            "a tenth of a block in front of it: drawn",
         );
     }
 

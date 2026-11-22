@@ -53,7 +53,8 @@ fn register_render_pipelines(
 
 `PipelineBlend::Translucent` lays the result over the frame by its alpha, and `Additive` adds it,
 scaled by its alpha. `WorldDepth::Tested` hides the quads behind nearer world surfaces, and
-`ThroughWalls` draws them over everything. No pipeline writes depth.
+`ThroughWalls` draws them over everything. A pipeline writes depth only when it asks to
+([Writing depth](#writing-depth)).
 
 The id must be in a namespace your mod owns. There is no per-mod pipeline count cap. A registration
 with an unowned namespace or a duplicate id is logged with the mod's id and dropped.
@@ -258,4 +259,51 @@ cause and resolves to `Invalid`:
 A pipeline without `.textured(…)` has no `pipeline_texture`: its file is refused with a note
 naming `RenderPipeline::textured`.
 
-A pipeline cannot sample more than one texture, write depth, or replace the vertex stage.
+A pipeline cannot sample more than one texture or replace the vertex stage.
+
+## Writing depth
+
+A pipeline can write depth as solid geometry does, so what draws after it (entities, translucent
+terrain, particles, weather) is hidden behind it or blends over it. This is for a surface the
+shader finds itself: a ray marched shape, a voxel or organic surface traced inside a proxy box.
+Ask for it when you register the pipeline, which must test depth:
+
+```rust,ignore
+event.pipelines.push(
+    RenderPipeline::new(id.clone(), id, PipelineBlend::Translucent, WorldDepth::Tested)
+        .writes_depth()
+        .reads_scene_depth(),
+);
+```
+
+Its `pipeline_fragment` then returns a `PipelineSurface` in place of a colour:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `color` | `vec4<f32>` | The surface's colour in linear light; alpha is coverage. |
+| `position` | `vec3<f32>` | Where the surface is, in blocks relative to the camera. |
+
+```wgsl
+fn pipeline_fragment(input: PipelineInput) -> PipelineSurface {
+    let ray = normalize(input.position);
+    let hit = trace(ray, pipeline_scene_distance(input)); // the mod's own: < 0 for a miss
+    if hit < 0.0 {
+        discard;
+    }
+    return PipelineSurface(vec4(shade(ray * hit), 1.0), ray * hit);
+}
+```
+
+The game writes the depth of `position` as the world's own view projects it, with its jitter, so
+the surface meets the terrain and later draws without a seam; a mod never handles the depth
+buffer's reversed values. A fragment whose `position` is behind the camera, nearer than the view's
+near plane or not finite draws nothing, and `discard` draws nothing too. The depth is tested
+against what is already drawn, then written: two traced surfaces hide each other as solid blocks
+do. Writing depth turns off the GPU's early depth test for the pipeline's fragments, so keep its
+quads to the parts of the view the surface can cover.
+
+The scene depth a pipeline reads is copied before any pipeline draws at `AfterOpaqueBlocks`, so it
+holds no depth written from that stage on (what a pipeline wrote at `AfterSky` is in it, under
+the terrain). A registration with `writes_depth` and
+`WorldDepth::ThroughWalls` is logged with its mod and dropped, and a file whose
+`pipeline_fragment` returns a colour is refused with a note naming `PipelineSurface`.

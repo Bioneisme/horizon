@@ -22,6 +22,7 @@ fn pipelines() -> [RenderPipeline; 3] {
         pipeline("wire_test:glow")
             .textured(PipelineTexture::Sprite(id("minecraft:item/diamond")))
             .reads_buffer("glow", 16)
+            .writes_depth()
             .optional(),
         pipeline("wire_test:plain")
             .reads_scene_depth()
@@ -154,6 +155,11 @@ fn a_wasm_mods_textured_pipelines_reach_the_host_as_a_native_mods_do() {
                         .map(|p| p.buffers.iter().map(|b| (b.name.as_str(), b.size)).collect())
                         .collect::<Vec<Vec<_>>>(),
                     [vec![], vec![("glow", 16)], vec![("blasts", 256), ("grid", 16 << 20)]],
+                    "guest {guest}"
+                );
+                assert_eq!(
+                    registered.iter().map(|p| p.depth_write).collect::<Vec<_>>(),
+                    [false, true, false],
                     "guest {guest}"
                 );
                 assert!(registered.iter().all(|p| p.owner() == "wire_test"));
