@@ -1,5 +1,5 @@
 //! Fixed-capacity output for a view's custom geometry; the GPU consumer owns drawing.
-use crate::gfx::mod_pipelines::{self, PipelineRun, PipelineVertex};
+use crate::gfx::mod_pipelines::{self, PipelineBufferWrite, PipelineRun, PipelineVertex};
 use crate::gfx::world_primitives::{Batch, DEFAULT_CAPACITY as CAPACITY, STAGES};
 use crate::{gizmos, mesher::Vertex};
 use glam::{DVec3, Mat4, Vec3, Vec4};
@@ -45,6 +45,9 @@ pub struct WorldGeometry {
     pipeline_runs: Vec<PipelineRun>,
     /// `PipelineFrame.time` for this view.
     time: f32,
+    /// Writes into mod pipelines' buffers, in the order written, and what they write.
+    buffer_writes: Vec<PipelineBufferWrite>,
+    buffer_bytes: Vec<u8>,
     copies: Vec<ModelCopy>,
     groups: std::collections::HashSet<mod_api::InstanceGroupRef>,
     accepted_models: u32,
@@ -65,6 +68,8 @@ impl Default for WorldGeometry {
             pipeline_quads: Vec::with_capacity(CAPACITY as usize * 4),
             pipeline_runs: Vec::with_capacity(CAPACITY as usize),
             time: 0.0,
+            buffer_writes: Vec::new(),
+            buffer_bytes: Vec::new(),
             copies: Vec::with_capacity(INSTANCE_CAPACITY as usize),
             groups: std::collections::HashSet::with_capacity(INSTANCE_CAPACITY as usize),
             accepted_models: 0,
@@ -84,6 +89,8 @@ impl WorldGeometry {
         self.quads.iter_mut().for_each(Vec::clear);
         self.pipeline_quads.clear();
         self.pipeline_runs.clear();
+        self.buffer_writes.clear();
+        self.buffer_bytes.clear();
         self.clear_copies();
         self.model_cut = 0;
         self.groups.clear();
@@ -322,6 +329,48 @@ impl WorldGeometry {
         }
         Ok(())
     }
+    /// Queue a write of `bytes` from byte `offset` into buffer `buffer` of the mod pipeline in
+    /// `slot`, whose buffers have `sizes`, or refuse it whole: no such buffer, past its end, an
+    /// offset or length that isn't a multiple of 4, or more this view than the buffer holds.
+    pub fn write_pipeline_buffer(
+        &mut self,
+        slot: u32,
+        sizes: &[u32],
+        buffer: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), PipelineDrawError> {
+        let size = *sizes
+            .get(buffer as usize)
+            .ok_or(PipelineDrawError::BufferRange)?;
+        let length = u32::try_from(bytes.len()).map_err(|_| PipelineDrawError::BufferRange)?;
+        if !offset.is_multiple_of(4)
+            || !length.is_multiple_of(4)
+            || offset.checked_add(length).is_none_or(|end| end > size)
+        {
+            return Err(PipelineDrawError::BufferRange);
+        }
+        let written: u32 = self
+            .buffer_writes
+            .iter()
+            .filter(|w| w.slot == slot && w.buffer == buffer)
+            .map(|w| w.bytes.len() as u32)
+            .sum();
+        if written + length > size {
+            return Err(PipelineDrawError::CapacityExceeded);
+        }
+        if length > 0 {
+            let start = self.buffer_bytes.len() as u32;
+            self.buffer_bytes.extend_from_slice(bytes);
+            self.buffer_writes.push(PipelineBufferWrite {
+                slot,
+                buffer,
+                offset,
+                bytes: start..start + length,
+            });
+        }
+        Ok(())
+    }
     /// Borrow the existing renderer's batch, with no copying or frame allocation. The frame's
     /// builder names the pipeline set the queued slots belong to.
     pub fn batch(&self) -> Batch<'_> {
@@ -336,6 +385,8 @@ impl WorldGeometry {
                 vertices: &self.pipeline_quads,
                 runs: &self.pipeline_runs,
                 time: self.time,
+                writes: &self.buffer_writes,
+                bytes: &self.buffer_bytes,
             },
         }
     }
@@ -548,6 +599,76 @@ mod tests {
                 draw.quads.each_ref().map(Vec::capacity)
             )
         );
+    }
+
+    /// A write into a pipeline's buffer is queued whole or refused whole: no such buffer, past
+    /// its end, an offset or length that isn't a multiple of 4, or more this view than the
+    /// buffer holds. A new view starts its budget again.
+    #[test]
+    fn buffer_writes_are_refused_whole_out_of_range_misaligned_or_over_the_frame_budget() {
+        use mod_pipelines::PipelineBufferWrite;
+        let mut draw = WorldGeometry::default();
+        draw.reset([0.0; 3], Mat4::IDENTITY, [0.0; 2]);
+        let sizes = [64u32];
+        draw.write_pipeline_buffer(3, &sizes, 0, 16, &[1; 16])
+            .unwrap();
+        let refused = Err(PipelineDrawError::BufferRange);
+        assert_eq!(
+            draw.write_pipeline_buffer(3, &sizes, 1, 0, &[0; 16]),
+            refused
+        );
+        assert_eq!(
+            draw.write_pipeline_buffer(3, &sizes, 0, 56, &[0; 16]),
+            refused
+        );
+        assert_eq!(
+            draw.write_pipeline_buffer(3, &sizes, 0, u32::MAX - 3, &[0; 8]),
+            refused
+        );
+        assert_eq!(
+            draw.write_pipeline_buffer(3, &sizes, 0, 2, &[0; 4]),
+            refused
+        );
+        assert_eq!(
+            draw.write_pipeline_buffer(3, &sizes, 0, 0, &[0; 3]),
+            refused
+        );
+        draw.write_pipeline_buffer(3, &sizes, 0, 0, &[2; 48])
+            .unwrap();
+        assert_eq!(
+            draw.write_pipeline_buffer(3, &sizes, 0, 0, &[0; 4]),
+            Err(PipelineDrawError::CapacityExceeded),
+            "64 bytes written this view: the buffer's size"
+        );
+        draw.write_pipeline_buffer(5, &sizes, 0, 0, &[3; 4])
+            .unwrap();
+
+        let batch = draw.batch();
+        let write = |slot, offset, bytes| PipelineBufferWrite {
+            slot,
+            buffer: 0,
+            offset,
+            bytes,
+        };
+        assert_eq!(
+            batch.pipelines.writes,
+            [
+                write(3, 16, 0..16),
+                write(3, 0, 16..64),
+                write(5, 0, 64..68)
+            ]
+        );
+        assert_eq!(&batch.pipelines.bytes[..16], [1; 16]);
+        assert_eq!(&batch.pipelines.bytes[16..64], [2; 48]);
+        assert!(
+            !batch.is_empty(),
+            "a frame of writes alone still uploads them"
+        );
+
+        draw.reset([0.0; 3], Mat4::IDENTITY, [0.0; 2]);
+        assert!(draw.batch().pipelines.writes.is_empty());
+        draw.write_pipeline_buffer(3, &sizes, 0, 0, &[0; 64])
+            .unwrap();
     }
 
     #[test]

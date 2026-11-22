@@ -6,8 +6,8 @@ fn id(text: &str) -> Identifier {
     Identifier::parse(text).unwrap()
 }
 
-/// The pipelines a mod registers: a mod's sprite, a vanilla item sprite, and one untextured that
-/// reads the scene depth.
+/// The pipelines a mod registers: a mod's sprite, a vanilla item sprite with a buffer, and one
+/// untextured that reads the scene depth and two buffers.
 fn pipelines() -> [RenderPipeline; 3] {
     let pipeline = |name: &str| {
         RenderPipeline::new(
@@ -21,9 +21,29 @@ fn pipelines() -> [RenderPipeline; 3] {
         pipeline("wire_test:orb").textured(PipelineTexture::Sprite(id("wire_test:block/charge"))),
         pipeline("wire_test:glow")
             .textured(PipelineTexture::Sprite(id("minecraft:item/diamond")))
+            .reads_buffer("glow", 16)
             .optional(),
-        pipeline("wire_test:plain").reads_scene_depth(),
+        pipeline("wire_test:plain")
+            .reads_scene_depth()
+            .reads_buffer("blasts", 256)
+            .reads_buffer("grid", 16 << 20),
     ]
+}
+
+/// Every refusal of a pipeline draw or buffer write crosses the wire as itself.
+#[test]
+fn pipeline_draw_refusals_round_trip() {
+    use mod_api::{PipelineDrawError as E, RenderPipelineError};
+    for cause in [
+        E::Pipeline(RenderPipelineError::Stale),
+        E::NonFinite,
+        E::CapacityExceeded,
+        E::BufferRange,
+    ] {
+        let mut out = Writer::new();
+        out.put(&cause);
+        assert_eq!(Reader::decode::<E>(out.bytes()).unwrap(), cause);
+    }
 }
 
 /// Every named texture refusal crosses the wire as itself.
@@ -126,6 +146,14 @@ fn a_wasm_mods_textured_pipelines_reach_the_host_as_a_native_mods_do() {
                 assert_eq!(
                     registered.iter().map(|p| p.scene_depth).collect::<Vec<_>>(),
                     [false, false, true],
+                    "guest {guest}"
+                );
+                assert_eq!(
+                    registered
+                        .iter()
+                        .map(|p| p.buffers.iter().map(|b| (b.name.as_str(), b.size)).collect())
+                        .collect::<Vec<Vec<_>>>(),
+                    [vec![], vec![("glow", 16)], vec![("blasts", 256), ("grid", 16 << 20)]],
                     "guest {guest}"
                 );
                 assert!(registered.iter().all(|p| p.owner() == "wire_test"));

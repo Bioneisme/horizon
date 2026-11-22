@@ -4588,7 +4588,7 @@ impl Renderer {
             world_primitives::WorldPrimitives::new(&device, (frame_format, linear_light));
         world_primitives.reserve(
             &device,
-            &mut |buffer, bytes| queue.write_buffer(buffer, 0, bytes),
+            &mut |buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes),
             world_primitives::DEFAULT_CAPACITY,
             world_primitives::DEFAULT_CAPACITY,
         );
@@ -9133,7 +9133,7 @@ impl Renderer {
             let (uploads, encoder) = (&mut self.uploads, &mut encoder);
             self.world_primitives.prepare(
                 &self.device,
-                &mut |buffer, bytes| uploads.buffer(encoder, buffer, 0, bytes),
+                &mut |buffer, offset, bytes| uploads.buffer(encoder, buffer, offset, bytes),
                 &frame.world_primitives,
                 jittered,
                 [self.config.width, self.config.height],

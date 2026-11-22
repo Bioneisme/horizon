@@ -11,8 +11,8 @@
 //! from the quad's vanilla-space colour and to the frame, which stores vanilla's 2.2 encoding
 //! in every format the renderer draws today.
 use mod_api::{
-    Identifier, PipelineBlend, PipelineTexture, PipelineTextureError, RenderPipeline,
-    RenderPipelineError, RenderPipelineRef, WorldDepth,
+    Identifier, PipelineBlend, PipelineBuffer, PipelineTexture, PipelineTextureError,
+    RenderPipeline, RenderPipelineError, RenderPipelineRef, WorldDepth,
 };
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use std::sync::OnceLock;
@@ -186,29 +186,55 @@ pub struct Built {
     pub texture: Option<BuiltTexture>,
     /// Whether its shader reads the scene depth ([`RenderPipeline::reads_scene_depth`]).
     pub scene_depth: bool,
+    /// The sizes of the buffers it reads, in bytes, in the order registered
+    /// ([`RenderPipeline::reads_buffer`]).
+    pub buffers: Vec<u32>,
 }
 
 /// What a pipeline's shader binds beyond group 0, as its registration asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Features {
+pub struct Features<'a> {
     /// `pipeline_texture`, in group 1 ([`RenderPipeline::textured`]).
     pub textured: bool,
     /// The scene depth functions, in group 2 ([`RenderPipeline::reads_scene_depth`]).
     pub scene_depth: bool,
+    /// The mod's buffers, in group 1 from [`FIRST_BUFFER_BINDING`] on
+    /// ([`RenderPipeline::reads_buffer`]).
+    pub buffers: &'a [PipelineBuffer],
 }
 
-impl Features {
+/// Group 1's binding of a pipeline's first buffer, after a texture's three.
+pub const FIRST_BUFFER_BINDING: u32 = 3;
+
+impl<'a> Features<'a> {
     /// What `pipeline` registered.
-    pub fn of(pipeline: &RenderPipeline) -> Self {
+    pub fn of(pipeline: &'a RenderPipeline) -> Self {
         Self {
             textured: pipeline.texture.is_some(),
             scene_depth: pipeline.scene_depth,
+            buffers: &pipeline.buffers,
         }
     }
 
     /// How many bindings the prelude declares.
     fn bindings(self) -> usize {
-        2 + if self.textured { 3 } else { 0 } + if self.scene_depth { 2 } else { 0 }
+        2 + if self.textured { 3 } else { 0 }
+            + if self.scene_depth { 2 } else { 0 }
+            + self.buffers.len()
+    }
+
+    /// The declarations of the buffers, by the names they were given.
+    fn buffer_bindings(self) -> String {
+        self.buffers
+            .iter()
+            .zip(FIRST_BUFFER_BINDING..)
+            .map(|(buffer, binding)| {
+                format!(
+                    "@group(1) @binding({binding}) var<storage, read> {}: array<vec4<f32>>;\n",
+                    buffer.name
+                )
+            })
+            .collect()
     }
 }
 
@@ -278,6 +304,7 @@ impl Pipelines {
                         optional: pipeline.optional,
                         texture,
                         scene_depth: pipeline.scene_depth,
+                        buffers: pipeline.buffers.iter().map(|b| b.size).collect(),
                     }),
                     Err(reason) => {
                         let refusal = format!(
@@ -416,7 +443,7 @@ pub fn texture_refusal(cause: PipelineTextureError) -> String {
 /// The prelude a pipeline's file follows.
 fn prelude(features: Features) -> String {
     format!(
-        "{PRELUDE_TYPES}{}{}{}",
+        "{PRELUDE_TYPES}{}{}{}{}",
         if features.textured {
             TEXTURE_PRELUDE
         } else {
@@ -427,6 +454,7 @@ fn prelude(features: Features) -> String {
         } else {
             ""
         },
+        features.buffer_bindings(),
         horizon_shader_api::stages::COLOR_HELPERS
     )
 }
@@ -743,6 +771,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
     const TEXTURED: Features = Features {
         textured: true,
         scene_depth: false,
+        buffers: &[],
     };
 
     #[test]
@@ -772,6 +801,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
     const READS_DEPTH: Features = Features {
         textured: false,
         scene_depth: true,
+        buffers: &[],
     };
 
     /// A pipeline registered with `reads_scene_depth` can call the scene depth functions and
@@ -791,6 +821,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
         let textured_and_depth = Features {
             textured: true,
             scene_depth: true,
+            buffers: &[],
         };
         assert!(compose_with(both, textured_and_depth).is_ok());
         let own = format!("@group(2) @binding(2) var<uniform> mine: f32;\n{DEPTH}");
@@ -812,6 +843,49 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
             glow.built()[0].as_ref().unwrap().scene_depth,
             "the registration decides, not the file"
         );
+    }
+
+    /// A pipeline reads its buffers by the names it registered them with, as arrays of
+    /// `vec4<f32>` in group 1 after a texture's bindings; a file naming one it didn't register
+    /// is refused, and the load keeps each buffer's size.
+    #[test]
+    fn a_pipeline_reads_its_buffers_by_the_names_it_gave() {
+        use mod_api::PipelineBuffer;
+        let reads = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return blasts[0] + grid[arrayLength(&grid) - 1u];
+}";
+        let buffers = [
+            PipelineBuffer::new("blasts", 64),
+            PipelineBuffer::new("grid", 16),
+        ];
+        let shader = compose_with(
+            reads,
+            Features {
+                buffers: &buffers,
+                ..Features::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            shader.contains("@group(1) @binding(3) var<storage, read> blasts: array<vec4<f32>>;")
+        );
+        assert!(
+            shader.contains("@group(1) @binding(4) var<storage, read> grid: array<vec4<f32>>;")
+        );
+        assert!(compose(reads).unwrap_err().contains("blasts"));
+        let textured = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * blasts[0]; }";
+        let both = Features {
+            textured: true,
+            buffers: &buffers[..1],
+            ..Features::default()
+        };
+        assert!(compose_with(textured, both).is_ok());
+
+        let registered = [pipeline("example:blasts", "example:blasts")
+            .reads_buffer("blasts", 64)
+            .reads_buffer("grid", 32)];
+        let set = Pipelines::build(&registered, 1, |_| Ok(reads.to_owned())).unwrap();
+        assert_eq!(set.built()[0].as_ref().unwrap().buffers, [64, 32]);
     }
 
     /// Every pipeline's input has its fragment's pixel, its place in the view and which side of

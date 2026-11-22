@@ -329,6 +329,21 @@ impl WorldDrawContext for GameWorldDrawContext<'_, '_> {
         self.game
             .native_world_draw_pipeline_quads(&mut *self.surface, pipeline, quads)
     }
+    fn write_pipeline_buffer(
+        &mut self,
+        pipeline: RenderPipelineRef,
+        buffer: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), PipelineDrawError> {
+        self.game.native_world_draw_write_pipeline_buffer(
+            &mut *self.surface,
+            pipeline,
+            buffer,
+            offset,
+            bytes,
+        )
+    }
     fn usage(&self) -> WorldDrawUsage {
         self.game.native_world_draw_usage(&*self.surface)
     }

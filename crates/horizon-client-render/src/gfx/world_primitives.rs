@@ -39,6 +39,7 @@ pub struct Batch<'a> {
 impl Batch<'_> {
     pub fn is_empty(&self) -> bool {
         self.pipelines.runs.is_empty()
+            && self.pipelines.writes.is_empty()
             && self.quads.is_empty()
             && self.quads_through.is_empty()
             && self.lines.is_empty()
@@ -84,7 +85,7 @@ struct AtlasGroup {
 
 /// Copies bytes into a buffer as part of the frame (the renderer's staging uploads, or the
 /// queue in a test). The callback consumes the bytes before returning; they may be reused.
-pub type Upload<'u> = &'u mut dyn FnMut(&wgpu::Buffer, &[u8]);
+pub type Upload<'u> = &'u mut dyn FnMut(&wgpu::Buffer, u64, &[u8]);
 
 impl WorldPrimitives {
     /// Pipelines drawing into `color_format` over a reversed Depth32Float depth, decoding their
@@ -297,7 +298,7 @@ impl WorldPrimitives {
                     mapped_at_creation: false,
                 });
             }
-            upload(&self.indices, bytes);
+            upload(&self.indices, 0, bytes);
         }
     }
 
@@ -335,20 +336,20 @@ impl WorldPrimitives {
                 self.quad_vertices.extend_from_slice(&q[..q.len() / 4 * 4]);
             }
             let bytes: &[u8] = bytemuck::cast_slice(&self.quad_vertices);
-            upload(&self.quads, bytes);
+            upload(&self.quads, 0, bytes);
         }
         if lines[0] + lines[1] > 0 {
             self.line_instances.clear();
             self.line_instances.extend_from_slice(batch.lines);
             self.line_instances.extend_from_slice(batch.lines_through);
             let bytes: &[u8] = bytemuck::cast_slice(&self.line_instances);
-            upload(&self.lines, bytes);
+            upload(&self.lines, 0, bytes);
         }
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             viewport: [viewport[0] as f32, viewport[1] as f32, 0.0, 0.0],
         };
-        upload(&self.globals, bytemuck::bytes_of(&globals));
+        upload(&self.globals, 0, bytemuck::bytes_of(&globals));
         if self.group.as_ref().is_none_or(|g| g.view != *atlas) {
             self.group = Some(AtlasGroup {
                 view: atlas.clone(),
@@ -582,7 +583,7 @@ mod tests {
         };
         assert!(!primitives.prepare(
             &device,
-            &mut |_, _| panic!("empty frames must not upload"),
+            &mut |_, _, _| panic!("empty frames must not upload"),
             &Batch::default(),
             view_proj,
             [SIZE, SIZE],
@@ -592,7 +593,7 @@ mod tests {
         let mut writes = Vec::new();
         primitives.reserve(
             &device,
-            &mut |buffer, bytes| writes.push((buffer.clone(), bytes.to_vec())),
+            &mut |buffer, _, bytes| writes.push((buffer.clone(), bytes.to_vec())),
             2,
             2,
         );
@@ -618,7 +619,7 @@ mod tests {
         assert_eq!(writes.len(), 1, "setup uploads only indices");
         assert!(primitives.prepare(
             &device,
-            &mut |buffer, bytes| writes.push((buffer.clone(), bytes.to_vec())),
+            &mut |buffer, _, bytes| writes.push((buffer.clone(), bytes.to_vec())),
             &batch,
             view_proj,
             [SIZE, SIZE],
@@ -661,7 +662,7 @@ mod tests {
             let indices = primitives.indices.clone();
             let active = primitives.prepare(
                 &device,
-                &mut |buffer, bytes| {
+                &mut |buffer, _, bytes| {
                     assert_ne!(*buffer, indices, "indices must not be regenerated");
                     queue.write_buffer(buffer, 0, bytes);
                     uploads += 1;
@@ -696,7 +697,7 @@ mod tests {
         let old_indices = primitives.indices.clone();
         primitives.prepare(
             &device,
-            &mut |buffer, bytes| {
+            &mut |buffer, _, bytes| {
                 if buffer.usage().contains(wgpu::BufferUsages::INDEX) {
                     index_upload.extend_from_slice(bytemuck::cast_slice::<u8, u32>(bytes));
                 }
@@ -809,7 +810,7 @@ mod tests {
         let atlas_view = atlas.create_view(&Default::default());
         assert!(primitives.prepare(
             &device,
-            &mut |buffer, bytes| queue.write_buffer(buffer, 0, bytes),
+            &mut |buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes),
             &batch,
             view_proj,
             [SIZE, SIZE],
@@ -836,7 +837,7 @@ mod tests {
         let replacement_view = replacement.create_view(&Default::default());
         primitives.prepare(
             &device,
-            &mut |buffer, bytes| queue.write_buffer(buffer, 0, bytes),
+            &mut |buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes),
             &batch,
             view_proj,
             [SIZE, SIZE],
@@ -846,7 +847,7 @@ mod tests {
         assert_ne!(replacement_group, original_group);
         primitives.prepare(
             &device,
-            &mut |buffer, bytes| queue.write_buffer(buffer, 0, bytes),
+            &mut |buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes),
             &batch,
             view_proj,
             [SIZE, SIZE],

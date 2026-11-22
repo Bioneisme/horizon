@@ -477,6 +477,21 @@ pub trait WorldDrawContext {
     ) -> Result<(), PipelineDrawError> {
         unimplemented!("WorldDrawContext::pipeline_quads")
     }
+    /// Write `bytes` into `pipeline`'s buffer at place `buffer` among those it registered with
+    /// [`RenderPipeline::reads_buffer`](crate::RenderPipeline::reads_buffer) (the first is 0),
+    /// from byte `offset`. The rest of the buffer keeps what it held, frame to frame, so write
+    /// only what changed. Every write of a frame lands before its first draw, in the order
+    /// written; a view writes at most the buffer's size into it. `offset` and the length are
+    /// multiples of 4. On `Err`, nothing of this call is written.
+    fn write_pipeline_buffer(
+        &mut self,
+        pipeline: RenderPipelineRef,
+        buffer: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), PipelineDrawError> {
+        unimplemented!("WorldDrawContext::write_pipeline_buffer")
+    }
     /// Queued counts and fixed capacities, shared by both depth modes and all listeners.
     /// Capacity is allocated during setup, never grown during submission.
     fn usage(&self) -> WorldDrawUsage {

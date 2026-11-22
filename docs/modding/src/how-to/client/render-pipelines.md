@@ -104,7 +104,8 @@ reload answers `Stale`.
 | `RenderPipelineError::Invalid` | The pipeline is optional and its shader file is missing, was refused or was rejected by the GPU. The log has a line `render pipeline <id> from mod <owner> refused: <file>: <reason>`, with the file's line number for a syntax or type error, or `render pipeline <id> from mod <owner> refused by the GPU: <reason>`. |
 | `RenderPipelineError::Stale` | The handle is from before a resource reload. |
 | `PipelineDrawError::NonFinite` | A corner or texture coordinate is not finite, or a camera-relative coordinate overflows `f32`. |
-| `PipelineDrawError::CapacityExceeded` | The view's 4,096 quads, shared with `WorldDrawContext::quads`, are used up. |
+| `PipelineDrawError::CapacityExceeded` | The view's 4,096 quads, shared with `WorldDrawContext::quads`, are used up; or a buffer write would pass what the view may write into it ([Your own data](#your-own-data)). |
+| `PipelineDrawError::BufferRange` | A buffer write names no buffer, reaches past its end, or has an offset or length that isn't a multiple of 4. |
 
 A refused batch draws nothing. An `Invalid` pipeline never stops the game from starting; a required
 pipeline that cannot be built does.
@@ -115,6 +116,59 @@ pipeline that cannot be built does.
 `render_level_stage`. Within a stage, pipeline quads draw after that stage's plain quads and
 lines, in the order submitted. Under a shader pack they follow the plain quads: a stage the pack
 draws itself is drawn with the next stage the game reaches.
+
+## Your own data
+
+A pipeline can read buffers of the mod's own data: the shapes a ray marcher traces, a grid of
+densities, the state of each thing it draws. Name each buffer and give its size in bytes when you
+register the pipeline:
+
+```rust,ignore
+event.pipelines.push(
+    RenderPipeline::new(id.clone(), id, PipelineBlend::Translucent, WorldDepth::Tested)
+        .reads_buffer("blasts", 256)
+        .optional(),
+);
+```
+
+The shader reads it by that name as an `array<vec4<f32>>`; `bitcast` a component for integers:
+
+```wgsl
+fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    let blast = blasts[0];
+    let count = bitcast<u32>(blasts[arrayLength(&blasts) - 1u].w);
+    return vec4(blast.rgb, f32(count) * 0.1);
+}
+```
+
+Write it from any hook that is given a `WorldDrawContext`, by the buffer's place among the
+pipeline's (the first is 0) and a byte offset:
+
+```rust,ignore
+let data: [[f32; 4]; 4] = blasts_this_frame();
+draw.write_pipeline_buffer(pipeline, 0, 0, bytemuck::cast_slice(&data))?;
+```
+
+A buffer starts as zeros and keeps what you wrote, across frames and resource reloads: write only
+what changes. Every write of a frame lands before its first draw, in the order written.
+
+| Limit | Value |
+| --- | --- |
+| Buffers per pipeline | 4 |
+| Size of one buffer | 16 bytes to 16 MiB, in steps of 16 |
+| A mod's buffers together | 64 MiB |
+| Written into one buffer per view | its size |
+| Offset and length of a write | multiples of 4 |
+
+A buffer's name starts with a letter and has only letters, digits and `_`; `frame` and names
+starting with `horizon_`, `pipeline_` or `Pipeline` are the game's. A registration past these
+limits is logged with its mod and dropped. A write is refused whole: `PipelineDrawError::BufferRange`
+for no buffer at that place, a range past its end or an offset or length that isn't a multiple of
+4, and `PipelineDrawError::CapacityExceeded` past what the view may write into it.
+
+Some GPUs, old ones through OpenGL, can't read buffers in a fragment shader. There a pipeline with
+buffers is refused as the GPU refuses a shader, so register it `.optional()` unless the mod can't
+run without it.
 
 ## Reading the scene depth
 
@@ -204,5 +258,4 @@ cause and resolves to `Invalid`:
 A pipeline without `.textured(…)` has no `pipeline_texture`: its file is refused with a note
 naming `RenderPipeline::textured`.
 
-A pipeline cannot take values of its own from the mod, sample more than one texture, write depth,
-or replace the vertex stage.
+A pipeline cannot sample more than one texture, write depth, or replace the vertex stage.

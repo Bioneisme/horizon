@@ -127,6 +127,25 @@ impl Game<'_> {
             .map_err(PipelineDrawError::Pipeline)?;
         draw.pipeline_quads(slot, quads)
     }
+    /// Queue a write into a mod pipeline's buffer, or refuse it whole: the handle is checked
+    /// against the published pipelines, the place and range against its buffers.
+    pub(super) fn native_world_draw_write_pipeline_buffer(
+        &self,
+        draw: &mut WorldGeometry,
+        pipeline: RenderPipelineRef,
+        buffer: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), PipelineDrawError> {
+        let pipelines = &self.pack.render.mod_pipelines;
+        let slot = pipelines
+            .slot(pipeline)
+            .map_err(PipelineDrawError::Pipeline)?;
+        let sizes = pipelines.built()[slot as usize]
+            .as_ref()
+            .map_or(&[][..], |built| built.buffers.as_slice());
+        draw.write_pipeline_buffer(slot, sizes, buffer, offset, bytes)
+    }
     /// Queued counts and fixed capacities, shared by both depth modes and all listeners.
     /// Capacity is allocated during setup, never grown during submission.
     pub(super) fn native_world_draw_usage(&self, draw: &WorldGeometry) -> WorldDrawUsage {

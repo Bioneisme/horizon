@@ -7,7 +7,9 @@
 //! load's renderer and the reload with it.
 
 use super::world_primitives::Upload;
-use crate::mod_pipelines::{Built, BuiltTexture, FRAGMENT_ENTRY, Pipelines, VERTEX_ENTRY};
+use crate::mod_pipelines::{
+    Built, BuiltTexture, FIRST_BUFFER_BINDING, FRAGMENT_ENTRY, Pipelines, VERTEX_ENTRY,
+};
 use glam::Mat4;
 use mod_api::{PipelineBlend, WorldDepth};
 
@@ -31,6 +33,20 @@ pub struct PipelineRun {
     pub quads: u32,
 }
 
+/// A write of a frame into a pipeline's buffer ([`mod_api::WorldDrawContext::write_pipeline_buffer`]),
+/// checked when the game queued it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineBufferWrite {
+    /// The pipeline's slot.
+    pub slot: u32,
+    /// The buffer's place among the pipeline's.
+    pub buffer: u32,
+    /// Where in the buffer it goes, in bytes.
+    pub offset: u32,
+    /// What it writes, in [`Batch::bytes`].
+    pub bytes: std::ops::Range<u32>,
+}
+
 /// A frame's pipeline quads, as the game queued them: 4 vertices a quad, in the runs' order.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Batch<'a> {
@@ -40,6 +56,9 @@ pub struct Batch<'a> {
     pub runs: &'a [PipelineRun],
     /// `PipelineFrame.time`.
     pub time: f32,
+    /// The frame's writes into the pipelines' buffers, in the order written.
+    pub writes: &'a [PipelineBufferWrite],
+    pub bytes: &'a [u8],
 }
 
 #[repr(C)]
@@ -67,7 +86,8 @@ pub struct TextureSources<'a> {
     pub sprite: &'a dyn Fn(&str) -> Option<[f32; 4]>,
 }
 
-/// A built pipeline, with its texture's bind group (group 1) when it is textured.
+/// A built pipeline, with the bind group of its texture and buffers (group 1) when it has
+/// either.
 struct Compiled {
     pipeline: wgpu::RenderPipeline,
     texture: Option<wgpu::BindGroup>,
@@ -84,10 +104,7 @@ struct SceneDepth {
 /// The pipelines and the buffer that draw a [`Batch`].
 pub struct ModPipelines {
     color_format: wgpu::TextureFormat,
-    /// By what a pipeline binds beyond group 0: [`layout_index`].
-    layouts: [wgpu::PipelineLayout; 4],
-    /// A texture, its sampler and where it lies in what is bound.
-    texture_layout: wgpu::BindGroupLayout,
+    group_layout: wgpu::BindGroupLayout,
     /// The scene depth and the inverse view.
     depth_layout: wgpu::BindGroupLayout,
     /// The inverse of the jittered view, which the scene depth functions read.
@@ -98,6 +115,9 @@ pub struct ModPipelines {
     scene: Option<SceneDepth>,
     /// Whether this frame copied the scene depth, since [`Self::prepare`].
     copied: bool,
+    /// The mods' buffers by pipeline slot, made when a load first builds a pipeline that reads
+    /// them and kept from then on: registrations don't change, so neither do their sizes.
+    buffers: Vec<Vec<wgpu::Buffer>>,
     /// The atlas's one sampler binding; `pipeline_texture` loads integer texels itself.
     sampler: wgpu::Sampler,
     group: wgpu::BindGroup,
@@ -131,28 +151,6 @@ impl ModPipelines {
                 uniform(1, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Mod pipeline texture"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                uniform(2, wgpu::ShaderStages::FRAGMENT),
-            ],
-        });
         let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mod pipeline scene depth"),
             entries: &[
@@ -168,19 +166,6 @@ impl ModPipelines {
                 },
                 uniform(1, wgpu::ShaderStages::FRAGMENT),
             ],
-        });
-        // Group 1 is left out of a pipeline that has no texture, as group 2 is of one that
-        // doesn't read the depth.
-        let layouts = [0, 1, 2, 3].map(|index| {
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Mod pipelines"),
-                bind_group_layouts: &[
-                    Some(&group_layout),
-                    (index & 1 != 0).then_some(&texture_layout),
-                    (index & 2 != 0).then_some(&depth_layout),
-                ][..if index & 2 != 0 { 3 } else { 1 + index }],
-                ..Default::default()
-            })
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Mod pipeline texture"),
@@ -220,13 +205,13 @@ impl ModPipelines {
         });
         Self {
             color_format,
-            layouts,
-            texture_layout,
+            group_layout,
             depth_layout,
             inverse,
             sky,
             scene: None,
             copied: false,
+            buffers: Vec::new(),
             sampler,
             group,
             view,
@@ -244,15 +229,29 @@ impl ModPipelines {
         &self,
         device: &wgpu::Device,
         built: &Built,
+        buffers: &[wgpu::Buffer],
         textures: Option<TextureSources<'_>>,
     ) -> Result<Compiled, String> {
-        let texture = match &built.texture {
+        if built.buffers.len() as u32 > device.limits().max_storage_buffers_per_shader_stage {
+            return Err("this GPU can't read the pipeline's buffers in a fragment shader".into());
+        }
+        let resources = resources_layout(device, built);
+        let texture = match &resources {
             None => None,
-            Some(texture) => {
-                let textures = textures.ok_or("no texture can be bound here")?;
-                Some(self.texture_group(device, texture, textures)?)
-            }
+            Some(layout) => Some(self.resources_group(device, layout, built, buffers, textures)?),
         };
+        let mut groups = vec![Some(&self.group_layout), resources.as_ref()];
+        if built.scene_depth {
+            groups.push(Some(&self.depth_layout));
+        }
+        while groups.last().is_some_and(Option::is_none) {
+            groups.pop();
+        }
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Mod pipeline"),
+            bind_group_layouts: &groups,
+            ..Default::default()
+        });
         // The shader text is a mod's or a pack's: a backend failing to compile it is an
         // internal error, and neither kind may reach the device's uncaptured handler.
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -281,7 +280,7 @@ impl ModPipelines {
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Mod pipeline"),
-            layout: Some(&self.layouts[layout_index(texture.is_some(), built.scene_depth)]),
+            layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some(VERTEX_ENTRY),
@@ -335,37 +334,48 @@ impl ModPipelines {
         }
     }
 
-    /// The bind group of a pipeline's texture: the atlas and its sprite's rect. Made when the
-    /// pipeline is built, never in a frame; a sprite the atlas lacks is refused by name.
-    fn texture_group(
+    /// The bind group of a pipeline's texture (the atlas and its sprite's rect) and buffers.
+    /// Made when the pipeline is built, never in a frame; a sprite the atlas lacks is refused by
+    /// name.
+    fn resources_group(
         &self,
         device: &wgpu::Device,
-        texture: &BuiltTexture,
-        sources: TextureSources<'_>,
+        layout: &wgpu::BindGroupLayout,
+        built: &Built,
+        buffers: &[wgpu::Buffer],
+        sources: Option<TextureSources<'_>>,
     ) -> Result<wgpu::BindGroup, String> {
         use wgpu::util::DeviceExt;
-        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let BuiltTexture::Sprite(name) = texture;
-        let Some(rect) = (sources.sprite)(name) else {
-            drop(pollster::block_on(validation.pop()));
-            return Err(format!(
-                "its texture sprite {name}: {}",
-                crate::mod_pipelines::texture_refusal(mod_api::PipelineTextureError::NoSuchSprite)
-            ));
+        let texture = match &built.texture {
+            None => None,
+            Some(BuiltTexture::Sprite(name)) => {
+                let sources = sources.ok_or("no texture can be bound here")?;
+                let Some(rect) = (sources.sprite)(name) else {
+                    return Err(format!(
+                        "its texture sprite {name}: {}",
+                        crate::mod_pipelines::texture_refusal(
+                            mod_api::PipelineTextureError::NoSuchSprite
+                        )
+                    ));
+                };
+                let rect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Mod pipeline texture rect"),
+                    contents: bytemuck::cast_slice(&rect),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                Some((sources.atlas.clone(), rect))
+            }
         };
-        let view = sources.atlas.clone();
-        let rect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Mod pipeline texture rect"),
-            contents: bytemuck::cast_slice(&rect),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Mod pipeline texture"),
-            layout: &self.texture_layout,
-            entries: &[
+        if buffers.len() != built.buffers.len() {
+            return Err("its buffers are not made".into());
+        }
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut entries = Vec::new();
+        if let Some((view, rect)) = &texture {
+            entries.extend([
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -375,11 +385,49 @@ impl ModPipelines {
                     binding: 2,
                     resource: rect.as_entire_binding(),
                 },
-            ],
+            ]);
+        }
+        entries.extend(
+            buffers
+                .iter()
+                .zip(FIRST_BUFFER_BINDING..)
+                .map(|(buffer, binding)| wgpu::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                }),
+        );
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Mod pipeline resources"),
+            layout,
+            entries: &entries,
         });
         match pollster::block_on(validation.pop()) {
             None => Ok(group),
-            Some(error) => Err(format!("its texture: {error}")),
+            Some(error) => Err(format!("its texture or buffers: {error}")),
+        }
+    }
+
+    /// Makes the buffers of `set`'s pipelines that have none yet, zeroed, by slot.
+    fn make_buffers(&mut self, device: &wgpu::Device, set: &Pipelines) {
+        self.buffers.resize_with(set.built().len(), Vec::new);
+        for (slot, built) in set.built().iter().enumerate() {
+            let Some(built) = built else { continue };
+            let have: Vec<u64> = self.buffers[slot].iter().map(wgpu::Buffer::size).collect();
+            let want: Vec<u64> = built.buffers.iter().map(|&size| u64::from(size)).collect();
+            if have == want {
+                continue;
+            }
+            self.buffers[slot] = want
+                .iter()
+                .map(|&size| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Mod pipeline buffer"),
+                        size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect();
         }
     }
 
@@ -393,13 +441,19 @@ impl ModPipelines {
         set: &Pipelines,
         textures: Option<TextureSources<'_>>,
     ) -> Result<(), String> {
-        self.build_with(set, |this, built| this.pipeline(device, built, textures))
+        if set.generation() != self.generation {
+            self.make_buffers(device, set);
+        }
+        self.build_with(set, |this, slot, built| {
+            let buffers = this.buffers.get(slot).map_or(&[][..], Vec::as_slice);
+            this.pipeline(device, built, buffers, textures)
+        })
     }
 
     fn build_with(
         &mut self,
         set: &Pipelines,
-        compile: impl Fn(&Self, &Built) -> Result<Compiled, String>,
+        compile: impl Fn(&Self, usize, &Built) -> Result<Compiled, String>,
     ) -> Result<(), String> {
         if set.generation() == self.generation {
             return Ok(());
@@ -411,7 +465,7 @@ impl ModPipelines {
             .enumerate()
             .map(|(slot, built)| {
                 let built = built.as_ref()?;
-                compile(self, built)
+                compile(self, slot, built)
                     .map_err(|error| refused.push((slot, built, error)))
                     .ok()
             })
@@ -452,6 +506,21 @@ impl ModPipelines {
     ) -> u32 {
         self.runs.clear();
         self.copied = false;
+        // Before the frame's own checks: a buffer belongs to its slot, whatever load drew.
+        for write in batch.writes {
+            let buffer = self
+                .buffers
+                .get(write.slot as usize)
+                .and_then(|b| b.get(write.buffer as usize));
+            let bytes = batch
+                .bytes
+                .get(write.bytes.start as usize..write.bytes.end as usize);
+            if let (Some(buffer), Some(bytes)) = (buffer, bytes)
+                && u64::from(write.offset) + bytes.len() as u64 <= buffer.size()
+            {
+                upload(buffer, u64::from(write.offset), bytes);
+            }
+        }
         if batch
             .set
             .is_none_or(|set| set.generation() != self.generation)
@@ -488,14 +557,19 @@ impl ModPipelines {
                 mapped_at_creation: false,
             });
         }
-        upload(&self.vertices, bytes);
-        upload(&self.view, bytemuck::cast_slice(&view_proj.to_cols_array()));
+        upload(&self.vertices, 0, bytes);
+        upload(
+            &self.view,
+            0,
+            bytemuck::cast_slice(&view_proj.to_cols_array()),
+        );
         if self.runs.iter().any(|run| self.reads_depth(run.slot)) {
             let inverse = view_proj.inverse().to_cols_array();
-            upload(&self.inverse, bytemuck::cast_slice(&inverse));
+            upload(&self.inverse, 0, bytemuck::cast_slice(&inverse));
         }
         upload(
             &self.frame,
+            0,
             bytemuck::bytes_of(&FrameUniform {
                 viewport: [viewport[0] as f32, viewport[1] as f32],
                 time: batch.time,
@@ -546,7 +620,8 @@ impl ModPipelines {
 
     /// Draws the prepared runs of stages `first..=last` in the order queued, with `indices`
     /// (6 a quad, `u32`). Leaves the pass with its own pipeline, bind group 0 and buffers, bind
-    /// group 1 after a textured pipeline and bind group 2 after one that reads the depth.
+    /// group 1 after a pipeline with a texture or buffers and bind group 2 after one that reads
+    /// the depth.
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -588,9 +663,61 @@ impl ModPipelines {
     }
 }
 
-/// Which of [`ModPipelines`]' layouts a pipeline is built with.
-fn layout_index(textured: bool, scene_depth: bool) -> usize {
-    usize::from(textured) | usize::from(scene_depth) << 1
+/// Group 1's layout for `built`: its texture, its sampler and where it lies in what is bound,
+/// then its buffers; none for a pipeline with neither.
+fn resources_layout(device: &wgpu::Device, built: &Built) -> Option<wgpu::BindGroupLayout> {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    let mut entries = Vec::new();
+    if built.texture.is_some() {
+        entries.extend([
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: fragment,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: fragment,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: fragment,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ]);
+    }
+    entries.extend(
+        (FIRST_BUFFER_BINDING..)
+            .take(built.buffers.len())
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: fragment,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }),
+    );
+    (!entries.is_empty()).then(|| {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mod pipeline resources"),
+            entries: &entries,
+        })
+    })
 }
 
 /// A depth texture the scene depth functions can read, `size` pixels big.
@@ -803,7 +930,7 @@ mod tests {
         }
         let drawn = primitives.prepare(
             device,
-            &mut |buffer, bytes| queue.write_buffer(buffer, 0, bytes),
+            &mut |buffer, offset, bytes| queue.write_buffer(buffer, offset, bytes),
             &world_primitives::Batch {
                 pipelines: batch,
                 ..Default::default()
@@ -936,7 +1063,7 @@ mod tests {
             "render pipeline test:p0 from mod owning_mod refused by the GPU: compiler refusal"
         );
         broken.shader = "not wgsl".into();
-        assert!(renderer.pipeline(&device, &broken, None).is_err());
+        assert!(renderer.pipeline(&device, &broken, &[], None).is_err());
         assert!(set.invalidate(0));
         assert_eq!(set.resolve(&id), Err(mod_api::RenderPipelineError::Invalid));
         assert_eq!(set.slot(handle), Err(mod_api::RenderPipelineError::Invalid));
@@ -956,14 +1083,14 @@ mod tests {
         let handle = set.resolve(&id).unwrap();
         let mut renderer = ModPipelines::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         renderer
-            .build_with(&set, |_, _| Err("injected refusal".into()))
+            .build_with(&set, |_, _, _| Err("injected refusal".into()))
             .unwrap();
         assert_eq!(renderer.generation, 41);
         assert!(renderer.pipelines[0].is_none());
         assert_eq!(set.slot(handle), Err(mod_api::RenderPipelineError::Invalid));
         assert!(!set.invalidate(0));
         renderer
-            .build_with(&set, |_, _| panic!("already compiled"))
+            .build_with(&set, |_, _, _| panic!("already compiled"))
             .unwrap();
     }
 
@@ -981,7 +1108,7 @@ mod tests {
         let handle = set.resolve(&id).unwrap();
         let mut refusing = ModPipelines::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         refusing
-            .build_with(&set, |_, _| Err("injected refusal".into()))
+            .build_with(&set, |_, _, _| Err("injected refusal".into()))
             .unwrap();
         assert_eq!(set.slot(handle), Err(mod_api::RenderPipelineError::Invalid));
         let mut recovered = ModPipelines::new(&device, wgpu::TextureFormat::Rgba8Unorm);
@@ -1018,7 +1145,7 @@ mod tests {
         let id = Identifier::parse("test:p0").unwrap();
         let handle = next.resolve(&id).unwrap();
         let error = renderer
-            .build_with(&next, |_, _| Err("injected refusal".into()))
+            .build_with(&next, |_, _, _| Err("injected refusal".into()))
             .unwrap_err();
         assert_eq!(
             error,
@@ -1076,6 +1203,7 @@ mod tests {
             vertices: &vertices,
             runs: &runs,
             time: 1.0,
+            ..Default::default()
         };
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
@@ -1161,6 +1289,7 @@ mod tests {
                 vertices: &vertices,
                 runs: &runs,
                 time: 0.0,
+                ..Default::default()
             };
             render(&gpu, &mut primitives, format, batch, STAGES - 1)(32, 32)
         };
@@ -1296,6 +1425,7 @@ mod tests {
                 vertices: &vertices,
                 runs: &runs,
                 time: 0.0,
+                ..Default::default()
             },
             STAGES - 1,
         );
@@ -1356,6 +1486,7 @@ mod tests {
             vertices: &vertices,
             runs: &runs,
             time: 0.0,
+            ..Default::default()
         };
         let format = wgpu::TextureFormat::Rgba16Float;
         let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
@@ -1436,9 +1567,91 @@ mod tests {
             vertices: &vertices,
             runs: &runs,
             time: 0.0,
+            ..Default::default()
         };
         let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
         assert_near(at(16, 32), [0.0, 255.0, 0.0, 255.0], 0.0, "the front");
         assert_near(at(48, 32), [255.0, 0.0, 0.0, 255.0], 0.0, "the back");
+    }
+
+    /// A pipeline reads what the mod wrote into its buffer; a later frame's write of part of it
+    /// keeps the rest, and the buffer outlives a reload that builds the pipeline again.
+    #[test]
+    fn a_pipeline_reads_what_the_mod_wrote_and_a_partial_write_keeps_the_rest() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let reads = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return select(data[0], data[1], input.uv.y > 0.5);
+}";
+        let id = Identifier::parse("test:p0").unwrap();
+        let registered = [RenderPipeline::new(
+            id.clone(),
+            id,
+            PipelineBlend::Translucent,
+            WorldDepth::ThroughWalls,
+        )
+        .reads_buffer("data", 32)];
+        let load = |generation| {
+            Pipelines::build(&registered, generation, |_| Ok(reads.to_owned())).unwrap()
+        };
+        let vertices = quad([0.0, 0.0, 64.0, 64.0], 2.0, [255; 4]);
+        let runs = [PipelineRun {
+            slot: 0,
+            stage: 4,
+            quads: 1,
+        }];
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let floats = |values: &[[f32; 4]]| -> Vec<u8> { bytemuck::cast_slice(values).to_vec() };
+        let (red, green, blue) = (
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        );
+        let mut draw = |set: &Pipelines, writes: &[PipelineBufferWrite], bytes: &[u8]| {
+            let batch = Batch {
+                set: Some(set),
+                vertices: &vertices,
+                runs: &runs,
+                writes,
+                bytes,
+                ..Default::default()
+            };
+            let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+            (at(32, 8), at(32, 56))
+        };
+        let write = |offset, bytes| PipelineBufferWrite {
+            slot: 0,
+            buffer: 0,
+            offset,
+            bytes,
+        };
+        let first = load(1);
+        let both = floats(&[red, green]);
+        let (top, bottom) = draw(&first, &[write(0, 0..32)], &both);
+        assert_near(top, [255.0, 0.0, 0.0, 255.0], 0.0, "the first vec4");
+        assert_near(bottom, [0.0, 255.0, 0.0, 255.0], 0.0, "the second vec4");
+
+        let second = floats(&[blue]);
+        let (top, bottom) = draw(&first, &[write(16, 0..16)], &second);
+        assert_near(
+            top,
+            [255.0, 0.0, 0.0, 255.0],
+            0.0,
+            "kept from the last frame",
+        );
+        assert_near(bottom, [0.0, 0.0, 255.0, 255.0], 0.0, "written over");
+
+        let (top, bottom) = draw(&load(2), &[], &[]);
+        assert_near(top, [255.0, 0.0, 0.0, 255.0], 0.0, "kept across a reload");
+        assert_near(
+            bottom,
+            [0.0, 0.0, 255.0, 255.0],
+            0.0,
+            "kept across a reload",
+        );
     }
 }

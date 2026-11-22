@@ -32,6 +32,9 @@ pub struct RenderPipeline {
     pub texture: Option<PipelineTexture>,
     /// Whether the shader reads the opaque scene's depth ([`Self::reads_scene_depth`]).
     pub scene_depth: bool,
+    /// The buffers of the mod's own data the shader reads, in the order registered
+    /// ([`Self::reads_buffer`]).
+    pub buffers: Vec<PipelineBuffer>,
 }
 impl RenderPipeline {
     /// Describe a required pipeline that draws [`PipelineVertexFormat::PositionTexColor`]
@@ -52,6 +55,7 @@ impl RenderPipeline {
             optional: false,
             texture: None,
             scene_depth: false,
+            buffers: Vec::new(),
         }
     }
     /// The owning mod, assigned by the host after registration.
@@ -85,6 +89,39 @@ impl RenderPipeline {
     pub fn reads_scene_depth(mut self) -> Self {
         self.scene_depth = true;
         self
+    }
+
+    /// Give the shader a buffer of `size` bytes of the mod's own data, read in the shader as
+    /// `name`, an `array<vec4<f32>>` (bitcast for other types). The mod writes it with
+    /// [`crate::WorldDrawContext::write_pipeline_buffer`], by its place among this pipeline's
+    /// buffers (the first is 0); it starts as zeros and keeps what was written across frames and
+    /// resource reloads. A pipeline reads at most 4 buffers, each 16 bytes to 16 MiB in steps of
+    /// 16, and a mod's buffers hold at most 64 MiB together; `name` starts with a letter, has
+    /// only letters, digits and `_`, and isn't the game's (`frame`, or starting `horizon_`,
+    /// `pipeline_` or `Pipeline`). A registration past these is logged and dropped.
+    pub fn reads_buffer(mut self, name: &str, size: u32) -> Self {
+        self.buffers.push(PipelineBuffer::new(name, size));
+        self
+    }
+}
+
+/// A buffer of a mod's own data a pipeline's shader reads ([`RenderPipeline::reads_buffer`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct PipelineBuffer {
+    /// The name the shader reads it by.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u32,
+}
+impl PipelineBuffer {
+    /// Describe a buffer; the registration checks it.
+    pub fn new(name: &str, size: u32) -> Self {
+        Self {
+            name: name.to_owned(),
+            size,
+        }
     }
 }
 
@@ -230,8 +267,58 @@ pub enum PipelineDrawError {
     /// A coordinate is not finite, or a camera-relative coordinate overflows f32.
     NonFinite,
     /// The batch would exceed this view's quad capacity, which pipeline quads share with
-    /// [`crate::WorldDrawContext::quads`].
+    /// [`crate::WorldDrawContext::quads`]; or a buffer write would bring what this view wrote
+    /// into that buffer past its size.
     CapacityExceeded,
+    /// The pipeline has no buffer at that place, or the write reaches past its end, or its
+    /// offset or length is not a multiple of 4.
+    BufferRange,
+}
+
+/// The most buffers a pipeline reads.
+const MAX_BUFFERS: usize = 4;
+/// The most bytes one buffer holds: 16 MiB.
+const MAX_BUFFER_BYTES: u32 = 16 << 20;
+/// The most bytes a mod's buffers hold together: 64 MiB.
+const MAX_MOD_BUFFER_BYTES: u64 = 64 << 20;
+
+/// Why `pipeline`'s buffers are refused, when its mod's earlier pipelines hold `held` bytes.
+fn buffers_refusal(pipeline: &RenderPipeline, held: u64) -> Option<&'static str> {
+    let buffers = &pipeline.buffers;
+    if buffers.len() > MAX_BUFFERS {
+        return Some("it reads more than 4 buffers");
+    }
+    if buffers
+        .iter()
+        .any(|b| b.size == 0 || !b.size.is_multiple_of(16) || b.size > MAX_BUFFER_BYTES)
+    {
+        return Some("a buffer's size is not 16 bytes to 16 MiB in steps of 16");
+    }
+    if buffers.iter().any(|b| !shader_name(&b.name)) {
+        return Some("a buffer's name is not one of its own the shader can use");
+    }
+    if buffers
+        .iter()
+        .enumerate()
+        .any(|(i, b)| buffers[..i].iter().any(|other| other.name == b.name))
+    {
+        return Some("two of its buffers have the same name");
+    }
+    let size: u64 = buffers.iter().map(|b| u64::from(b.size)).sum();
+    (held + size > MAX_MOD_BUFFER_BYTES).then_some("the mod's buffers would hold more than 64 MiB")
+}
+
+/// A name a mod may give a buffer: a WGSL identifier of letters, digits and `_` that starts with
+/// a letter and is none of the names the game puts before the mod's file.
+fn shader_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.len() <= 64
+        && !["horizon_", "pipeline_", "Pipeline"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        && name != "frame"
 }
 
 /// What `owner` added to `pipelines` in `register_render_pipelines`, checked as it returns: a
@@ -260,7 +347,13 @@ fn validate_in(
         } else if pipelines.iter().any(|kept| kept.id == pipeline.id) {
             Some("an earlier registration has that id")
         } else {
-            None
+            let held = pipelines
+                .iter()
+                .filter(|kept| kept.owner == owner)
+                .flat_map(|kept| &kept.buffers)
+                .map(|b| u64::from(b.size))
+                .sum();
+            buffers_refusal(&pipeline, held)
         };
         match refusal {
             Some(reason) => log::warn!(
@@ -316,6 +409,46 @@ mod tests {
         pipelines.push(pipeline("shared:glow"));
         validate_in("late", &previous, &mut pipelines, &|_| true);
         assert_eq!(pipelines, previous);
+    }
+
+    /// A pipeline's buffers are refused with the pipeline unless each is 16 bytes to 16 MiB in
+    /// steps of 16, there are at most 4, each has a name of its own the shader can use, and the
+    /// mod's buffers come to no more than 64 MiB.
+    #[test]
+    fn a_pipelines_buffers_must_keep_to_the_limits() {
+        let with = |id: &str, buffers: &[(&str, u32)]| {
+            buffers
+                .iter()
+                .fold(pipeline(id), |p, (name, size)| p.reads_buffer(name, *size))
+        };
+        let mut pipelines = vec![
+            with("mine:ok", &[("blasts", 256), ("grid_2", 16 << 20)]),
+            with("mine:odd", &[("blasts", 100)]),
+            with("mine:empty", &[("blasts", 0)]),
+            with("mine:huge", &[("blasts", (16 << 20) + 16)]),
+            with(
+                "mine:many",
+                &[("a", 16), ("b", 16), ("c", 16), ("d", 16), ("e", 16)],
+            ),
+            with("mine:twice", &[("a", 16), ("a", 16)]),
+            with("mine:games", &[("horizon_view", 16)]),
+            with("mine:prelude", &[("pipeline_data", 16)]),
+            with("mine:frame", &[("frame", 16)]),
+            with("mine:digit", &[("1st", 16)]),
+            with("mine:space", &[("my data", 16)]),
+        ];
+        validate_in("mine", &[], &mut pipelines, &|_| true);
+        assert_eq!(ids(&pipelines), ["mine:ok"]);
+
+        // 64 MiB for the mod: the fifth 16 MiB buffer is refused, another mod's still fits.
+        let previous = vec![with("other:big", &[("data", 16 << 20)])];
+        let mut big = previous.clone();
+        big.extend((0..5).map(|i| with(&format!("mine:b{i}"), &[("data", 16 << 20)])));
+        validate_in("mine", &previous, &mut big, &|_| true);
+        assert_eq!(
+            ids(&big),
+            ["other:big", "mine:b0", "mine:b1", "mine:b2", "mine:b3"]
+        );
     }
 
     #[test]
