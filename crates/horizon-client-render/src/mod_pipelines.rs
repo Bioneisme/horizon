@@ -54,12 +54,12 @@ struct PipelineFrame {
 ";
 
 /// What a textured pipeline's file can use as well ([`RenderPipeline::textured`]): its texture,
-/// bound by the renderer in group 1, and the function that samples it.
+/// bound by the renderer in group 2, and the function that samples it.
 const TEXTURE_PRELUDE: &str = "\
-@group(1) @binding(0) var horizon_pipeline_texture: texture_2d<f32>;
-@group(1) @binding(1) var horizon_pipeline_sampler: sampler;
+@group(2) @binding(0) var horizon_pipeline_texture: texture_2d<f32>;
+@group(2) @binding(1) var horizon_pipeline_sampler: sampler;
 // Where the sprite lies in the atlas: [u0, v0, u1, v1].
-@group(1) @binding(2) var<uniform> horizon_pipeline_rect: vec4<f32>;
+@group(2) @binding(2) var<uniform> horizon_pipeline_rect: vec4<f32>;
 // The pipeline's sprite at `uv`: 0 to 1 spans it once and beyond that it repeats. One texel by
 // integer coordinates inside the sprite's rect at mip 0 (`repeat_texel` is the same arithmetic),
 // in linear light, with its alpha.
@@ -75,12 +75,14 @@ fn pipeline_texture(uv: vec2<f32>) -> vec4<f32> {
 
 /// What a pipeline that reads the scene depth can use as well
 /// ([`RenderPipeline::reads_scene_depth`]): the opaque world's depth, copied by the renderer and
-/// bound in group 2, the inverse of the view it was drawn with, and the functions that read them.
+/// bound in group 1, the inverse of the view it was drawn with, and the functions that read them.
+/// Group 1 is the same for every pipeline that reads it, so a switch between them keeps it bound;
+/// what differs from pipeline to pipeline comes after it, in group 2.
 const SCENE_DEPTH_PRELUDE: &str = "\
-@group(2) @binding(0) var horizon_pipeline_scene_depth: texture_depth_2d;
+@group(1) @binding(0) var horizon_pipeline_scene_depth: texture_depth_2d;
 // From the view's clip space back to blocks relative to the camera: the inverse of the jittered
 // view the world is drawn with.
-@group(2) @binding(1) var<uniform> horizon_pipeline_scene_inverse: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> horizon_pipeline_scene_inverse: mat4x4<f32>;
 // The opaque world's depth behind this fragment: reversed, nearer is greater, 0 over the sky.
 fn pipeline_scene_depth(input: PipelineInput) -> f32 {
     let size = vec2<i32>(textureDimensions(horizon_pipeline_scene_depth));
@@ -194,16 +196,16 @@ pub struct Built {
 /// What a pipeline's shader binds beyond group 0, as its registration asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features<'a> {
-    /// `pipeline_texture`, in group 1 ([`RenderPipeline::textured`]).
+    /// `pipeline_texture`, in group 2 ([`RenderPipeline::textured`]).
     pub textured: bool,
-    /// The scene depth functions, in group 2 ([`RenderPipeline::reads_scene_depth`]).
+    /// The scene depth functions, in group 1 ([`RenderPipeline::reads_scene_depth`]).
     pub scene_depth: bool,
-    /// The mod's buffers, in group 1 from [`FIRST_BUFFER_BINDING`] on
+    /// The mod's buffers, in group 2 from [`FIRST_BUFFER_BINDING`] on
     /// ([`RenderPipeline::reads_buffer`]).
     pub buffers: &'a [PipelineBuffer],
 }
 
-/// Group 1's binding of a pipeline's first buffer, after a texture's three.
+/// Group 2's binding of a pipeline's first buffer, after a texture's three.
 pub const FIRST_BUFFER_BINDING: u32 = 3;
 
 impl<'a> Features<'a> {
@@ -230,7 +232,7 @@ impl<'a> Features<'a> {
             .zip(FIRST_BUFFER_BINDING..)
             .map(|(buffer, binding)| {
                 format!(
-                    "@group(1) @binding({binding}) var<storage, read> {}: array<vec4<f32>>;\n",
+                    "@group(2) @binding({binding}) var<storage, read> {}: array<vec4<f32>>;\n",
                     buffer.name
                 )
             })
@@ -778,7 +780,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
     fn only_a_textured_pipeline_samples_and_neither_binds_its_own() {
         let sample = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * input.color; }";
         let shader = compose_with(sample, TEXTURED).unwrap();
-        assert!(shader.contains("@group(1) @binding(0) var horizon_pipeline_texture"));
+        assert!(shader.contains("@group(2) @binding(0) var horizon_pipeline_texture"));
         assert!(
             compose(sample)
                 .unwrap_err()
@@ -791,8 +793,8 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
                 .unwrap_err()
                 .contains("declares a binding")
         );
-        // Untextured pipelines compose as before: no group 1.
-        assert!(!compose(GLOW).unwrap().contains("@group(1)"));
+        // Untextured pipelines compose as before: no group 2.
+        assert!(!compose(GLOW).unwrap().contains("@group(2)"));
     }
 
     const DEPTH: &str = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
@@ -816,7 +818,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
                 .unwrap_err()
                 .contains("RenderPipeline::reads_scene_depth")
         );
-        assert!(!compose(GLOW).unwrap().contains("@group(2)"));
+        assert!(!compose(GLOW).unwrap().contains("@group(1)"));
         let both = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * pipeline_scene_depth(input); }";
         let textured_and_depth = Features {
             textured: true,
@@ -824,7 +826,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
             buffers: &[],
         };
         assert!(compose_with(both, textured_and_depth).is_ok());
-        let own = format!("@group(2) @binding(2) var<uniform> mine: f32;\n{DEPTH}");
+        let own = format!("@group(1) @binding(2) var<uniform> mine: f32;\n{DEPTH}");
         assert!(
             compose_with(&own, READS_DEPTH)
                 .unwrap_err()
@@ -846,7 +848,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
     }
 
     /// A pipeline reads its buffers by the names it registered them with, as arrays of
-    /// `vec4<f32>` in group 1 after a texture's bindings; a file naming one it didn't register
+    /// `vec4<f32>` in group 2 after a texture's bindings; a file naming one it didn't register
     /// is refused, and the load keeps each buffer's size.
     #[test]
     fn a_pipeline_reads_its_buffers_by_the_names_it_gave() {
@@ -867,10 +869,10 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
         )
         .unwrap();
         assert!(
-            shader.contains("@group(1) @binding(3) var<storage, read> blasts: array<vec4<f32>>;")
+            shader.contains("@group(2) @binding(3) var<storage, read> blasts: array<vec4<f32>>;")
         );
         assert!(
-            shader.contains("@group(1) @binding(4) var<storage, read> grid: array<vec4<f32>>;")
+            shader.contains("@group(2) @binding(4) var<storage, read> grid: array<vec4<f32>>;")
         );
         assert!(compose(reads).unwrap_err().contains("blasts"));
         let textured = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * blasts[0]; }";

@@ -48,6 +48,8 @@ pub struct WorldGeometry {
     /// Writes into mod pipelines' buffers, in the order written, and what they write.
     buffer_writes: Vec<PipelineBufferWrite>,
     buffer_bytes: Vec<u8>,
+    /// The bytes this view wrote into each pipeline's buffer, by slot and place.
+    buffer_written: std::collections::HashMap<(u32, u32), u32>,
     copies: Vec<ModelCopy>,
     groups: std::collections::HashSet<mod_api::InstanceGroupRef>,
     accepted_models: u32,
@@ -70,6 +72,7 @@ impl Default for WorldGeometry {
             time: 0.0,
             buffer_writes: Vec::new(),
             buffer_bytes: Vec::new(),
+            buffer_written: std::collections::HashMap::new(),
             copies: Vec::with_capacity(INSTANCE_CAPACITY as usize),
             groups: std::collections::HashSet::with_capacity(INSTANCE_CAPACITY as usize),
             accepted_models: 0,
@@ -91,6 +94,7 @@ impl WorldGeometry {
         self.pipeline_runs.clear();
         self.buffer_writes.clear();
         self.buffer_bytes.clear();
+        self.buffer_written.clear();
         self.clear_copies();
         self.model_cut = 0;
         self.groups.clear();
@@ -350,17 +354,19 @@ impl WorldGeometry {
         {
             return Err(PipelineDrawError::BufferRange);
         }
-        let written: u32 = self
-            .buffer_writes
-            .iter()
-            .filter(|w| w.slot == slot && w.buffer == buffer)
-            .map(|w| w.bytes.len() as u32)
-            .sum();
-        if written + length > size {
+        let written = self
+            .buffer_written
+            .get(&(slot, buffer))
+            .copied()
+            .unwrap_or(0);
+        // The view's bytes are addressed by u32: a write past that is refused as over budget.
+        let start = u32::try_from(self.buffer_bytes.len()).ok();
+        if written + length > size || start.and_then(|s| s.checked_add(length)).is_none() {
             return Err(PipelineDrawError::CapacityExceeded);
         }
         if length > 0 {
-            let start = self.buffer_bytes.len() as u32;
+            let start = start.expect("checked above");
+            self.buffer_written.insert((slot, buffer), written + length);
             self.buffer_bytes.extend_from_slice(bytes);
             self.buffer_writes.push(PipelineBufferWrite {
                 slot,

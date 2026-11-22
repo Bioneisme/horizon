@@ -5031,6 +5031,7 @@ impl Renderer {
     /// After a frame given up whose uploads never reached the GPU (#13624): what frames upload
     /// only when it changes is uploaded again.
     fn upload_again(&mut self) {
+        self.world_primitives.pipelines.forget();
         self.lightmap_uploaded = false;
         self.lightmap_key = None;
         self.static_entity_catalog_revision = 0;

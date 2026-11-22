@@ -4,6 +4,7 @@ ids = [
     "type:PipelineDrawError",
     "handle:RenderPipeline::reads_buffer",
     "method:WorldDrawContext::write_pipeline_buffer",
+    "method:WorldDrawContext::pipeline_quads",
 ]
 why = "A mod render pipeline can read up to 4 buffers of the mod's own data (RenderPipeline::reads_buffer: a name and a size, 16 bytes to 16 MiB, 64 MiB per mod), as array<vec4<f32>> in its shader. WorldDrawContext::write_pipeline_buffer writes part or all of one from any draw hook; a buffer starts as zeros and keeps what was written across frames and resource reloads. RenderPipeline gains buffers and PipelineDrawError gains BufferRange, so both wire layouts change for wasm mods."
 migrate = "Pipelines without buffers are unchanged; RenderPipeline::new leaves buffers empty. A match on PipelineDrawError meets BufferRange only from write_pipeline_buffer. Rebuild wasm mods against this SDK for the changed RenderPipeline and PipelineDrawError wire layouts."
