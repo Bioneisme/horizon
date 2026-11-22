@@ -2053,4 +2053,65 @@ mod tests {
         );
         assert!(set.resolve(&id("test:plain")).is_ok());
     }
+
+    /// A real device made with one storage buffer per shader stage, as a GPU below the
+    /// pipeline's count reports it: the optional pipeline reading two is refused before anything
+    /// is made for it, with no error on the device, while one reading a single buffer and a
+    /// plain one build.
+    #[test]
+    fn an_optional_pipeline_reading_more_buffers_than_the_gpu_allows_is_refused() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let instance = crate::gfx::test_gpu::instance();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let descriptor = wgpu::DeviceDescriptor {
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (device, _queue) = pollster::block_on(adapter.request_device(&descriptor)).unwrap();
+        assert_eq!(device.limits().max_storage_buffers_per_shader_stage, 1);
+        let id = |name: &str| Identifier::parse(name).unwrap();
+        let pipeline = |name: &str| {
+            RenderPipeline::new(
+                id(name),
+                id(name),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            )
+            .optional()
+        };
+        let registered = [
+            pipeline("test:two")
+                .reads_buffer("a", 16)
+                .reads_buffer("b", 16),
+            pipeline("test:one").reads_buffer("a", 16),
+            pipeline("test:plain"),
+        ];
+        let set = Pipelines::build(&registered, 3, |file| {
+            Ok(if file.ends_with("two.wgsl") {
+                "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return a[0] + b[0]; }"
+            } else if file.ends_with("one.wgsl") {
+                "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return a[0]; }"
+            } else {
+                PASS
+            }
+            .to_owned())
+        })
+        .unwrap();
+        let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut renderer = ModPipelines::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.build(&device, &set, None).unwrap();
+        assert!(pollster::block_on(errors.pop()).is_none());
+        assert_eq!(
+            set.resolve(&id("test:two")),
+            Err(mod_api::RenderPipelineError::Invalid)
+        );
+        assert!(set.resolve(&id("test:one")).is_ok());
+        assert!(set.resolve(&id("test:plain")).is_ok());
+    }
 }
