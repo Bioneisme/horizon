@@ -23,6 +23,9 @@ The game puts this before your file:
 | `input.uv` | `vec2<f32>` | The quad's texture coordinate at this fragment, as its corners gave it. |
 | `input.color` | `vec4<f32>` | The quad's colour in linear light; alpha is coverage. |
 | `input.position` | `vec3<f32>` | This point in blocks, relative to the camera. |
+| `input.pixel` | `vec2<f32>` | This fragment's pixel in the world picture, from the top left; a pixel's centre is at `.5`. |
+| `input.screen` | `vec2<f32>` | This fragment's place in the view: -1 to 1 from left to right and from bottom to top. |
+| `input.front_facing` | `bool` | Whether this is the quad's front: its corners run top left, bottom left, bottom right, top right as seen. |
 | `frame.time` | `f32` | Seconds of game time, smooth between ticks, wrapping to 0 every hour. |
 | `frame.viewport` | `vec2<f32>` | The world picture's size in pixels. |
 
@@ -113,6 +116,47 @@ pipeline that cannot be built does.
 lines, in the order submitted. Under a shader pack they follow the plain quads: a stage the pack
 draws itself is drawn with the next stage the game reaches.
 
+## Reading the scene depth
+
+A pipeline can read how far the opaque world is at its pixel: for shapes it traces itself (a ray
+marched cloud or volume, a surface found inside a proxy box) and for decals laid on the terrain.
+Ask for it when you register the pipeline:
+
+```rust,ignore
+event.pipelines.push(
+    RenderPipeline::new(id.clone(), id, PipelineBlend::Translucent, WorldDepth::Tested)
+        .reads_scene_depth(),
+);
+```
+
+The shader then has three more functions, each reading the scene behind the fragment it is given
+(`input`):
+
+| Function | Returns |
+| --- | --- |
+| `pipeline_scene_depth(input)` | The depth buffer's value there: reversed, so nearer is greater, and `0.0` where nothing opaque is (the sky). |
+| `pipeline_scene_position(input)` | The opaque surface there, in blocks relative to the camera. Over the sky, the point where the view's depth range ends. |
+| `pipeline_scene_distance(input)` | How far that surface is along the fragment's ray, in blocks, and `3.0e38` over the sky. |
+
+```wgsl
+fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    // How much of the ray through this fragment runs before the terrain stops it.
+    let to_terrain = pipeline_scene_distance(input) - length(input.position);
+    return vec4(input.color.rgb, input.color.a * clamp(to_terrain / 8.0, 0.0, 1.0));
+}
+```
+
+The depth is the opaque world only: solid and cutout terrain, as the frame holds it after them
+(`AfterOpaqueBlocks`). The game copies it once a frame at that point, and only when a pipeline that
+reads it has quads queued. Pipeline quads at `AfterSky` read sky everywhere; from
+`AfterOpaqueBlocks` on, every stage reads the same copy, so neither translucent terrain, entities,
+particles nor a pipeline's own quads are in it. Under a shader pack that draws the terrain itself,
+there is no such point in the frame and the depth reads as sky.
+
+The depth is read at the fragment's own pixel, at the world's draw resolution, and the position
+and distance come from the same jittered projection the world is drawn with, so a traced surface
+meets the terrain without a seam under any render scale or anti-aliasing.
+
 ## Sampling a texture
 
 A pipeline can sample one texture (vanilla's `Sampler0`). Name it when you register the pipeline:
@@ -160,5 +204,5 @@ cause and resolves to `Invalid`:
 A pipeline without `.textured(…)` has no `pipeline_texture`: its file is refused with a note
 naming `RenderPipeline::textured`.
 
-A pipeline cannot take values of its own from the mod, sample more than one texture, or replace the
-vertex stage.
+A pipeline cannot take values of its own from the mod, sample more than one texture, write depth,
+or replace the vertex stage.

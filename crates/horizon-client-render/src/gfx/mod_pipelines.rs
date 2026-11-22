@@ -68,15 +68,36 @@ pub struct TextureSources<'a> {
 }
 
 /// A built pipeline, with its texture's bind group (group 1) when it is textured.
-type Compiled = (wgpu::RenderPipeline, Option<wgpu::BindGroup>);
+struct Compiled {
+    pipeline: wgpu::RenderPipeline,
+    texture: Option<wgpu::BindGroup>,
+    /// It binds the scene depth in group 2.
+    scene_depth: bool,
+}
+
+/// The opaque world's depth as this frame copied it, for the pipelines that read it.
+struct SceneDepth {
+    texture: wgpu::Texture,
+    group: wgpu::BindGroup,
+}
 
 /// The pipelines and the buffer that draw a [`Batch`].
 pub struct ModPipelines {
     color_format: wgpu::TextureFormat,
-    layout: wgpu::PipelineLayout,
-    /// Group 0, then a texture, its sampler and where it lies in what is bound.
-    textured_layout: wgpu::PipelineLayout,
+    /// By what a pipeline binds beyond group 0: [`layout_index`].
+    layouts: [wgpu::PipelineLayout; 4],
+    /// A texture, its sampler and where it lies in what is bound.
     texture_layout: wgpu::BindGroupLayout,
+    /// The scene depth and the inverse view.
+    depth_layout: wgpu::BindGroupLayout,
+    /// The inverse of the jittered view, which the scene depth functions read.
+    inverse: wgpu::Buffer,
+    /// Group 2 over a depth of 0 everywhere: before the copy, and on a frame without one.
+    sky: wgpu::BindGroup,
+    /// What the last copy went into, sized as its source.
+    scene: Option<SceneDepth>,
+    /// Whether this frame copied the scene depth, since [`Self::prepare`].
+    copied: bool,
     /// The atlas's one sampler binding; `pipeline_texture` loads integer texels itself.
     sampler: wgpu::Sampler,
     group: wgpu::BindGroup,
@@ -110,11 +131,6 @@ impl ModPipelines {
                 uniform(1, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Mod pipelines"),
-            bind_group_layouts: &[Some(&group_layout)],
-            ..Default::default()
-        });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mod pipeline texture"),
             entries: &[
@@ -137,10 +153,34 @@ impl ModPipelines {
                 uniform(2, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        let textured_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Mod textured pipelines"),
-            bind_group_layouts: &[Some(&group_layout), Some(&texture_layout)],
-            ..Default::default()
+        let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mod pipeline scene depth"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                uniform(1, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        // Group 1 is left out of a pipeline that has no texture, as group 2 is of one that
+        // doesn't read the depth.
+        let layouts = [0, 1, 2, 3].map(|index| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Mod pipelines"),
+                bind_group_layouts: &[
+                    Some(&group_layout),
+                    (index & 1 != 0).then_some(&texture_layout),
+                    (index & 2 != 0).then_some(&depth_layout),
+                ][..if index & 2 != 0 { 3 } else { 1 + index }],
+                ..Default::default()
+            })
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Mod pipeline texture"),
@@ -160,6 +200,10 @@ impl ModPipelines {
             std::mem::size_of::<FrameUniform>() as u64,
             wgpu::BufferUsages::UNIFORM,
         );
+        let inverse = buffer("Mod pipeline inverse view", 64, wgpu::BufferUsages::UNIFORM);
+        // A depth texture reads 0 until something is drawn into it: the sky everywhere.
+        let sky = depth_texture(device, [1, 1], wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let sky = depth_group(device, &depth_layout, &sky, &inverse);
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Mod pipelines"),
             layout: &group_layout,
@@ -176,9 +220,13 @@ impl ModPipelines {
         });
         Self {
             color_format,
-            layout,
-            textured_layout,
+            layouts,
             texture_layout,
+            depth_layout,
+            inverse,
+            sky,
+            scene: None,
+            copied: false,
             sampler,
             group,
             view,
@@ -233,11 +281,7 @@ impl ModPipelines {
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Mod pipeline"),
-            layout: Some(if texture.is_some() {
-                &self.textured_layout
-            } else {
-                &self.layout
-            }),
+            layout: Some(&self.layouts[layout_index(texture.is_some(), built.scene_depth)]),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some(VERTEX_ENTRY),
@@ -282,7 +326,11 @@ impl ModPipelines {
         let internal = pollster::block_on(internal.pop());
         let validation = pollster::block_on(validation.pop());
         match internal.or(validation) {
-            None => Ok((pipeline, texture)),
+            None => Ok(Compiled {
+                pipeline,
+                texture,
+                scene_depth: built.scene_depth,
+            }),
             Some(error) => Err(error.to_string()),
         }
     }
@@ -403,6 +451,7 @@ impl ModPipelines {
         viewport: [u32; 2],
     ) -> u32 {
         self.runs.clear();
+        self.copied = false;
         if batch
             .set
             .is_none_or(|set| set.generation() != self.generation)
@@ -441,6 +490,10 @@ impl ModPipelines {
         }
         upload(&self.vertices, bytes);
         upload(&self.view, bytemuck::cast_slice(&view_proj.to_cols_array()));
+        if self.runs.iter().any(|run| self.reads_depth(run.slot)) {
+            let inverse = view_proj.inverse().to_cols_array();
+            upload(&self.inverse, bytemuck::cast_slice(&inverse));
+        }
         upload(
             &self.frame,
             bytemuck::bytes_of(&FrameUniform {
@@ -452,9 +505,48 @@ impl ModPipelines {
         quads
     }
 
+    fn reads_depth(&self, slot: usize) -> bool {
+        matches!(self.pipelines.get(slot), Some(Some(c)) if c.scene_depth)
+    }
+
+    /// Whether a prepared run reads the scene depth at a stage past `AfterSky`: then the frame
+    /// copies it with [`Self::copy_scene_depth`] where `AfterOpaqueBlocks` draws.
+    pub fn wants_scene_depth(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| run.stage > 0 && self.reads_depth(run.slot))
+    }
+
+    /// Copies `depth`, the world's depth after its opaque terrain, for the pipelines of the
+    /// stages from `AfterOpaqueBlocks` on, when [`Self::wants_scene_depth`]; it needs
+    /// `COPY_SRC`. Outside a pass: the caller ends the world pass first and starts another.
+    pub fn copy_scene_depth(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        depth: &wgpu::Texture,
+    ) {
+        if !self.wants_scene_depth() {
+            return;
+        }
+        let size = depth.size();
+        if self.scene.as_ref().is_none_or(|s| s.texture.size() != size) {
+            let texture = depth_texture(
+                device,
+                [size.width, size.height],
+                wgpu::TextureUsages::COPY_DST,
+            );
+            let group = depth_group(device, &self.depth_layout, &texture, &self.inverse);
+            self.scene = Some(SceneDepth { texture, group });
+        }
+        let scene = self.scene.as_ref().expect("made above");
+        encoder.copy_texture_to_texture(depth.as_image_copy(), scene.texture.as_image_copy(), size);
+        self.copied = true;
+    }
+
     /// Draws the prepared runs of stages `first..=last` in the order queued, with `indices`
-    /// (6 a quad, `u32`). Leaves the pass with its own pipeline, bind group 0 and buffers, and
-    /// bind group 1 after a textured pipeline.
+    /// (6 a quad, `u32`). Leaves the pass with its own pipeline, bind group 0 and buffers, bind
+    /// group 1 after a textured pipeline and bind group 2 after one that reads the depth.
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -467,7 +559,12 @@ impl ModPipelines {
             if run.stage < first || run.stage > last {
                 continue;
             }
-            let Some(Some((pipeline, texture))) = self.pipelines.get(run.slot) else {
+            let Some(Some(Compiled {
+                pipeline,
+                texture,
+                scene_depth,
+            })) = self.pipelines.get(run.slot)
+            else {
                 continue;
             };
             if !bound {
@@ -481,9 +578,66 @@ impl ModPipelines {
             if let Some(texture) = texture {
                 pass.set_bind_group(1, texture, &[]);
             }
+            // At `AfterSky`, and on a frame that took no copy, the depth is the sky's.
+            if *scene_depth {
+                let scene = self.scene.as_ref().filter(|_| self.copied && run.stage > 0);
+                pass.set_bind_group(2, scene.map_or(&self.sky, |s| &s.group), &[]);
+            }
             pass.draw_indexed(run.quads.start * 6..run.quads.end * 6, 0, 0..1);
         }
     }
+}
+
+/// Which of [`ModPipelines`]' layouts a pipeline is built with.
+fn layout_index(textured: bool, scene_depth: bool) -> usize {
+    usize::from(textured) | usize::from(scene_depth) << 1
+}
+
+/// A depth texture the scene depth functions can read, `size` pixels big.
+fn depth_texture(
+    device: &wgpu::Device,
+    [width, height]: [u32; 2],
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Mod pipeline scene depth"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: usage | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// Group 2 over `depth`, with the inverse view.
+fn depth_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    depth: &wgpu::Texture,
+    inverse: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Mod pipeline scene depth"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &depth.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: inverse.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 fn gpu_refusal(built: &Built, error: &str) -> String {
@@ -585,14 +739,33 @@ mod tests {
         ]
     }
 
+    /// The depth of a wall 5 blocks ahead, as the frame stores it.
+    fn wall() -> f32 {
+        view_proj().project_point3(Vec3::new(0.0, 0.0, -5.0)).z
+    }
+
     /// Draws `batch`'s stages up to `last` over the cleared frame of `format`, behind a wall
     /// 5 blocks ahead, and reads the frame back as RGBA floats.
     fn render(
+        gpu: &(wgpu::Device, wgpu::Queue),
+        primitives: &mut WorldPrimitives,
+        format: wgpu::TextureFormat,
+        batch: Batch<'_>,
+        last: usize,
+    ) -> impl Fn(u32, u32) -> [f32; 4] + use<> {
+        render_over(gpu, primitives, format, batch, last, wall())
+    }
+
+    /// [`render`] over a world whose depth is `ground` everywhere, as a frame draws it: the
+    /// first stage, then the scene depth's copy where `AfterOpaqueBlocks` draws, then the rest
+    /// in a pass that loads both targets.
+    fn render_over(
         (device, queue): &(wgpu::Device, wgpu::Queue),
         primitives: &mut WorldPrimitives,
         format: wgpu::TextureFormat,
         batch: Batch<'_>,
         last: usize,
+        ground: f32,
     ) -> impl Fn(u32, u32) -> [f32; 4] + use<> {
         let texture = |size: u32, format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -618,14 +791,13 @@ mod tests {
         let depth = texture(
             SIZE,
             wgpu::TextureFormat::Depth32Float,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         );
         let atlas = texture(
             1,
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::TEXTURE_BINDING,
         );
-        let wall = view_proj().project_point3(Vec3::new(0.0, 0.0, -5.0)).z;
         if let Some(set) = batch.set {
             primitives.pipelines.build(device, set, None).unwrap();
         }
@@ -641,39 +813,60 @@ mod tests {
             &atlas.create_view(&Default::default()),
         );
         let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let color_view = color.create_view(&Default::default());
-            let depth_view = depth.create_view(&Default::default());
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: CLEAR,
-                            g: CLEAR,
-                            b: CLEAR,
-                            a: 1.0,
+        let color_view = color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let pass = |encoder: &mut wgpu::CommandEncoder, clear: bool| {
+            encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if clear {
+                                wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: CLEAR,
+                                    g: CLEAR,
+                                    b: CLEAR,
+                                    a: 1.0,
+                                })
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: if clear {
+                                wgpu::LoadOp::Clear(ground)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wall),
-                        store: wgpu::StoreOp::Store,
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-            if drawn {
-                primitives.draw_through(&mut pass, &mut 0, last);
-            }
+                    ..Default::default()
+                })
+                .forget_lifetime()
+        };
+        let mut next = 0;
+        let mut first = pass(&mut encoder, true);
+        if drawn {
+            primitives.draw_through(&mut first, &mut next, 0);
         }
+        drop(first);
+        primitives
+            .pipelines
+            .copy_scene_depth(device, &mut encoder, &depth);
+        let mut rest = pass(&mut encoder, false);
+        if drawn {
+            primitives.draw_through(&mut rest, &mut next, last);
+        }
+        drop(rest);
         let float = format == wgpu::TextureFormat::Rgba16Float;
         let texel = if float { 8 } else { 4 };
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1070,14 +1263,14 @@ mod tests {
             primitives.pipelines.pipelines[0]
                 .as_ref()
                 .unwrap()
-                .1
+                .texture
                 .is_some()
         );
         assert!(
             primitives.pipelines.pipelines[3]
                 .as_ref()
                 .unwrap()
-                .1
+                .texture
                 .is_none()
         );
         let mut vertices = Vec::new();
@@ -1112,5 +1305,140 @@ mod tests {
         assert_near(pixel(8, 24), green, 1.0, "the sprite, not the atlas's red");
         assert_near(pixel(40, 24), green, 1.0, "the sprite repeated");
         assert_near(pixel(8, 40), [255.0; 4], 1.0, "the untextured pipeline");
+    }
+
+    /// The frame's light as a float frame stores it: vanilla's 2.2 encoding.
+    fn stored(linear: f32) -> f32 {
+        linear.powf(1.0 / 2.2)
+    }
+
+    /// A pipeline that reads the scene depth gets the opaque world behind each fragment: its
+    /// distance along the fragment's ray and its position, from the copy taken after the first
+    /// stage. At that first stage, and over the sky, it reads sky; a frame whose depth-reading
+    /// quads are all at the first stage takes no copy.
+    #[test]
+    fn a_pipeline_reads_the_opaque_depth_behind_its_fragment() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        // Red: the distance in tens of blocks; green: sky; blue: how far ahead the surface is.
+        let reads = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    let distance = pipeline_scene_distance(input);
+    let sky = distance > 1.0e37;
+    let ahead = -pipeline_scene_position(input).z;
+    return vec4<f32>(select(distance / 10.0, 0.0, sky), select(0.0, 1.0, sky), select(ahead / 10.0, 0.0, sky), 1.0);
+}";
+        let id = Identifier::parse("test:p0").unwrap();
+        let registered = [RenderPipeline::new(
+            id.clone(),
+            id,
+            PipelineBlend::Translucent,
+            WorldDepth::ThroughWalls,
+        )
+        .reads_scene_depth()];
+        let set = Pipelines::build(&registered, 5, |_| Ok(reads.to_owned())).unwrap();
+        let vertices = [
+            quad([0.0, 0.0, 64.0, 32.0], 2.0, [255; 4]),
+            quad([0.0, 32.0, 64.0, 64.0], 2.0, [255; 4]),
+        ]
+        .concat();
+        let run = |stage| PipelineRun {
+            slot: 0,
+            stage,
+            quads: 1,
+        };
+        // The top half at AfterSky, the bottom half at AfterOpaqueBlocks.
+        let runs = [run(0), run(1)];
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            time: 0.0,
+        };
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        assert!(primitives.pipelines.wants_scene_depth());
+        let sky = [0.0, 1.0, 0.0, 1.0];
+        assert_near(at(32, 8), sky, 0.002, "AfterSky reads the sky");
+        // The wall 5 blocks ahead, behind the pixel (x, y): along its ray from the camera.
+        let behind = |x: u32, y: u32| {
+            let screen = Vec3::new(
+                (x as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0,
+                1.0 - (y as f32 + 0.5) / SIZE as f32 * 2.0,
+                wall(),
+            );
+            view_proj().inverse().project_point3(screen)
+        };
+        for (x, y) in [(32, 48), (0, 63), (63, 32)] {
+            let wall = behind(x, y);
+            assert!(
+                (wall.z + 5.0).abs() < 1e-3,
+                "the wall is 5 blocks ahead: {wall}"
+            );
+            assert_near(
+                at(x, y),
+                [stored(wall.length() / 10.0), 0.0, stored(0.5), 1.0],
+                0.003,
+                &format!(
+                    "the wall behind ({x}, {y}), {} blocks along its ray",
+                    wall.length()
+                ),
+            );
+        }
+
+        let at = render_over(&gpu, &mut primitives, format, batch, STAGES - 1, 0.0);
+        assert_near(at(32, 48), sky, 0.002, "nothing opaque: the sky");
+
+        let early = [run(0), run(0)];
+        let batch = Batch {
+            runs: &early,
+            ..batch
+        };
+        drop(render(&gpu, &mut primitives, format, batch, STAGES - 1));
+        assert!(
+            !primitives.pipelines.wants_scene_depth(),
+            "AfterSky alone needs no copy"
+        );
+    }
+
+    /// `input.front_facing` is true on the side a quad's corners run top left, bottom left,
+    /// bottom right, top right, as world quads are given, and false on the other.
+    #[test]
+    fn front_facing_tells_the_two_sides_of_a_quad_apart() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let side = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return select(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0), input.front_facing);
+}";
+        let set = load(
+            6,
+            &[(side, PipelineBlend::Translucent, WorldDepth::ThroughWalls)],
+        );
+        let front = quad([0.0, 0.0, 32.0, 64.0], 2.0, [255; 4]);
+        let mut back = quad([32.0, 0.0, 64.0, 64.0], 2.0, [255; 4]);
+        back.reverse();
+        let vertices = [front, back].concat();
+        let runs = [PipelineRun {
+            slot: 0,
+            stage: 4,
+            quads: 2,
+        }];
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            time: 0.0,
+        };
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        assert_near(at(16, 32), [0.0, 255.0, 0.0, 255.0], 0.0, "the front");
+        assert_near(at(48, 32), [255.0, 0.0, 0.0, 255.0], 0.0, "the back");
     }
 }

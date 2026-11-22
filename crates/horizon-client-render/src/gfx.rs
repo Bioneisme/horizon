@@ -10369,7 +10369,12 @@ impl Renderer {
             .and_then(|m| m.msaa?.1.as_ref());
         // A material stage's translucent pass reads a copy of the depth the solid terrain
         // left: it is stored across the pass that ends before the copy.
-        let keep_depth = keep_depth || material.is_some() || msaa_on;
+        // So does a mod pipeline that reads the scene depth: its copy is taken where
+        // `AfterOpaqueBlocks` draws.
+        let scene_depth = world_primitives
+            && !pack_draws_terrain
+            && self.world_primitives.pipelines.wants_scene_depth();
+        let keep_depth = keep_depth || material.is_some() || msaa_on || scene_depth;
         // GPU culling's occlusion test splits the world pass as cull.rs's does.
         let gpu_occluding = gpu_frame && self.gpu_culling.as_ref().is_some_and(|g| g.occluding());
         let pack_frame = |pass: &mut wgpu::RenderPass<'_>| {
@@ -10914,6 +10919,27 @@ impl Renderer {
             // RenderLevelStageEvent.AfterOpaqueBlocks: after solid and cutout terrain, before
             // entities.
             if world_primitives && !pack_draws_terrain {
+                // The opaque world's depth for the mods' pipelines that read it: the pass ends,
+                // the depth is copied, and a pass that loads both targets carries on.
+                if scene_depth {
+                    drop(pass);
+                    self.world_primitives.pipelines.copy_scene_depth(
+                        &self.device,
+                        &mut encoder,
+                        world_depth.texture(),
+                    );
+                    pass = world_pass_after_culling(
+                        &mut encoder,
+                        world_view,
+                        world_depth,
+                        keep_depth,
+                        self.own_timing.as_mut(),
+                        "World after scene depth",
+                        world_pixels,
+                    );
+                    pass.set_bind_group(0, &self.group, &[]);
+                    pack_frame(&mut pass);
+                }
                 self.world_primitives
                     .draw_through(&mut pass, &mut primitive_stage, 1);
                 pass.set_bind_group(0, &self.group, &[]);

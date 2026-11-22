@@ -1,0 +1,6 @@
+ids = [
+    "type:RenderPipeline",
+    "handle:RenderPipeline::reads_scene_depth",
+]
+why = "A mod render pipeline can read the opaque scene's depth at its pixel (RenderPipeline::reads_scene_depth): pipeline_scene_depth, pipeline_scene_position and pipeline_scene_distance, from a copy the game takes once a frame after the opaque terrain, only when such a pipeline draws. Every pipeline's PipelineInput gains pixel and front_facing. RenderPipeline gains the scene_depth field, so its wire layout changes for wasm mods."
+migrate = "Pipelines that don't read the depth are unchanged; RenderPipeline::new leaves scene_depth false. Rebuild wasm mods against this SDK for the changed RenderPipeline wire layout."

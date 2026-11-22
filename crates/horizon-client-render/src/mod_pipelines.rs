@@ -34,6 +34,13 @@ struct PipelineInput {
     color: vec4<f32>,
     // This point in blocks, relative to the camera.
     position: vec3<f32>,
+    // This fragment's pixel in the world picture, from the top left; a pixel's centre is at .5.
+    pixel: vec2<f32>,
+    // This fragment's place in the view: -1 to 1 from left to right and from bottom to top.
+    screen: vec2<f32>,
+    // Whether this is the quad's front: its corners run top left, bottom left, bottom right,
+    // top right as seen.
+    front_facing: bool,
 }
 // The frame's values, the same for every fragment.
 struct PipelineFrame {
@@ -66,6 +73,36 @@ fn pipeline_texture(uv: vec2<f32>) -> vec4<f32> {
 }
 ";
 
+/// What a pipeline that reads the scene depth can use as well
+/// ([`RenderPipeline::reads_scene_depth`]): the opaque world's depth, copied by the renderer and
+/// bound in group 2, the inverse of the view it was drawn with, and the functions that read them.
+const SCENE_DEPTH_PRELUDE: &str = "\
+@group(2) @binding(0) var horizon_pipeline_scene_depth: texture_depth_2d;
+// From the view's clip space back to blocks relative to the camera: the inverse of the jittered
+// view the world is drawn with.
+@group(2) @binding(1) var<uniform> horizon_pipeline_scene_inverse: mat4x4<f32>;
+// The opaque world's depth behind this fragment: reversed, nearer is greater, 0 over the sky.
+fn pipeline_scene_depth(input: PipelineInput) -> f32 {
+    let size = vec2<i32>(textureDimensions(horizon_pipeline_scene_depth));
+    let at = clamp(vec2<i32>(floor(input.pixel)), vec2<i32>(0), size - 1);
+    return textureLoad(horizon_pipeline_scene_depth, at, 0);
+}
+// The opaque surface behind this fragment, in blocks relative to the camera; over the sky, where
+// the view's depth range ends.
+fn pipeline_scene_position(input: PipelineInput) -> vec3<f32> {
+    let point = horizon_pipeline_scene_inverse
+        * vec4<f32>(input.screen, pipeline_scene_depth(input), 1.0);
+    return point.xyz / point.w;
+}
+// How far the opaque surface is along this fragment's ray, in blocks; 3.0e38 over the sky.
+fn pipeline_scene_distance(input: PipelineInput) -> f32 {
+    if pipeline_scene_depth(input) <= 0.0 {
+        return 3.0e38;
+    }
+    return length(pipeline_scene_position(input));
+}
+";
+
 /// `pipeline_texture`'s texel arithmetic, for testing without a GPU: the integer texel of an
 /// atlas `size` texels wide and high that `uv` picks inside the sprite at `rect` (`[u0, v0, u1,
 /// v1]`). The fraction of `uv` (negative values wrap) spans the rect once; the texel is always
@@ -89,6 +126,8 @@ struct HorizonPipelineVertex {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) position: vec3<f32>,
+    // The clip position again, interpolated: the fragment's place in the view.
+    @location(3) screen: vec4<f32>,
 }
 @vertex fn horizon_vs_pipeline(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>) -> HorizonPipelineVertex {
@@ -97,10 +136,14 @@ struct HorizonPipelineVertex {
     out.uv = uv;
     out.color = color;
     out.position = position;
+    out.screen = out.clip;
     return out;
 }
-@fragment fn horizon_fs_pipeline(in: HorizonPipelineVertex) -> @location(0) vec4<f32> {
-    let result = pipeline_fragment(PipelineInput(in.uv, horizon_decode_rgba(in.color), in.position));
+@fragment fn horizon_fs_pipeline(in: HorizonPipelineVertex, @builtin(front_facing) front: bool)
+    -> @location(0) vec4<f32> {
+    let input = PipelineInput(in.uv, horizon_decode_rgba(in.color), in.position, in.clip.xy,
+        in.screen.xy / in.screen.w, front);
+    let result = pipeline_fragment(input);
     // Coverage only: no light rides in the frame's alpha, and NaN covers nothing.
     let coverage = clamp(select(0.0, result.a, result.a > 0.0), 0.0, 1.0);
     return vec4<f32>(horizon_encode(result.rgb), coverage);
@@ -141,6 +184,32 @@ pub struct Built {
     pub optional: bool,
     /// What its shader samples, if anything.
     pub texture: Option<BuiltTexture>,
+    /// Whether its shader reads the scene depth ([`RenderPipeline::reads_scene_depth`]).
+    pub scene_depth: bool,
+}
+
+/// What a pipeline's shader binds beyond group 0, as its registration asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Features {
+    /// `pipeline_texture`, in group 1 ([`RenderPipeline::textured`]).
+    pub textured: bool,
+    /// The scene depth functions, in group 2 ([`RenderPipeline::reads_scene_depth`]).
+    pub scene_depth: bool,
+}
+
+impl Features {
+    /// What `pipeline` registered.
+    pub fn of(pipeline: &RenderPipeline) -> Self {
+        Self {
+            textured: pipeline.texture.is_some(),
+            scene_depth: pipeline.scene_depth,
+        }
+    }
+
+    /// How many bindings the prelude declares.
+    fn bindings(self) -> usize {
+        2 + if self.textured { 3 } else { 0 } + if self.scene_depth { 2 } else { 0 }
+    }
 }
 
 /// A textured pipeline's texture as a load found it ([`PipelineTexture`]).
@@ -188,7 +257,7 @@ impl Pipelines {
             .map(|pipeline| {
                 let mut file = fragment_file(&pipeline.fragment);
                 let loaded = read(&file)
-                    .and_then(|text| compose_with(&text, pipeline.texture.is_some()))
+                    .and_then(|text| compose_with(&text, Features::of(pipeline)))
                     .and_then(|shader| {
                         let texture = match &pipeline.texture {
                             None => None,
@@ -208,6 +277,7 @@ impl Pipelines {
                         depth: pipeline.depth,
                         optional: pipeline.optional,
                         texture,
+                        scene_depth: pipeline.scene_depth,
                     }),
                     Err(reason) => {
                         let refusal = format!(
@@ -344,23 +414,33 @@ pub fn texture_refusal(cause: PipelineTextureError) -> String {
 }
 
 /// The prelude a pipeline's file follows.
-fn prelude(textured: bool) -> String {
+fn prelude(features: Features) -> String {
     format!(
-        "{PRELUDE_TYPES}{}{}",
-        if textured { TEXTURE_PRELUDE } else { "" },
+        "{PRELUDE_TYPES}{}{}{}",
+        if features.textured {
+            TEXTURE_PRELUDE
+        } else {
+            ""
+        },
+        if features.scene_depth {
+            SCENE_DEPTH_PRELUDE
+        } else {
+            ""
+        },
         horizon_shader_api::stages::COLOR_HELPERS
     )
 }
 
 /// The whole shader of an untextured pipeline whose file is `text` ([`compose_with`]).
 pub fn compose(text: &str) -> Result<String, String> {
-    compose_with(text, false)
+    compose_with(text, Features::default())
 }
 
-/// The whole shader of a pipeline whose file is `text`, with `pipeline_texture` when it is
-/// `textured`, or why the file is refused, with the file's own line where there is one.
-pub fn compose_with(text: &str, textured: bool) -> Result<String, String> {
-    let prelude = prelude(textured);
+/// The whole shader of a pipeline whose file is `text`, with `pipeline_texture` and the scene
+/// depth functions when its `features` have them, or why the file is refused, with the file's
+/// own line where there is one.
+pub fn compose_with(text: &str, features: Features) -> Result<String, String> {
+    let prelude = prelude(features);
     let mut shader = format!("{prelude}{text}\n");
     let located = |at: Option<usize>, message: String| match at
         .and_then(|at| at.checked_sub(prelude.len()))
@@ -385,8 +465,11 @@ pub fn compose_with(text: &str, textured: bool) -> Result<String, String> {
             .and_then(|(span, _)| span.to_range())
             .map(|range| range.start);
         let mut message = e.message().to_owned();
-        if !textured && text.contains("pipeline_texture") {
+        if !features.textured && text.contains("pipeline_texture") {
             message += " (`pipeline_texture` needs a texture: RenderPipeline::textured)";
+        }
+        if !features.scene_depth && text.contains("pipeline_scene_") {
+            message += " (the scene depth functions need RenderPipeline::reads_scene_depth)";
         }
         located(at, message)
     })?;
@@ -408,7 +491,7 @@ pub fn compose_with(text: &str, textured: bool) -> Result<String, String> {
         .iter()
         .filter(|(_, variable)| variable.binding.is_some())
         .count()
-        != if textured { 5 } else { 2 }
+        != features.bindings()
     {
         return Err("it declares a binding; a pipeline reads only `frame` and its input".into());
     }
@@ -657,10 +740,15 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
 
     /// A textured pipeline's file can call `pipeline_texture`; an untextured one is told why
     /// it can't, and neither may declare a binding of its own.
+    const TEXTURED: Features = Features {
+        textured: true,
+        scene_depth: false,
+    };
+
     #[test]
     fn only_a_textured_pipeline_samples_and_neither_binds_its_own() {
         let sample = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * input.color; }";
-        let shader = compose_with(sample, true).unwrap();
+        let shader = compose_with(sample, TEXTURED).unwrap();
         assert!(shader.contains("@group(1) @binding(0) var horizon_pipeline_texture"));
         assert!(
             compose(sample)
@@ -670,12 +758,70 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
         let own = "@group(1) @binding(3) var<uniform> mine: f32;
 fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * mine; }";
         assert!(
-            compose_with(own, true)
+            compose_with(own, TEXTURED)
                 .unwrap_err()
                 .contains("declares a binding")
         );
         // Untextured pipelines compose as before: no group 1.
         assert!(!compose(GLOW).unwrap().contains("@group(1)"));
+    }
+
+    const DEPTH: &str = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return vec4<f32>(pipeline_scene_depth(input), pipeline_scene_distance(input), length(pipeline_scene_position(input)), 1.0);
+}";
+    const READS_DEPTH: Features = Features {
+        textured: false,
+        scene_depth: true,
+    };
+
+    /// A pipeline registered with `reads_scene_depth` can call the scene depth functions and
+    /// builds as one that reads it; any other is told what to register, and keeps its shader
+    /// as it was.
+    #[test]
+    fn only_a_depth_reading_pipeline_reads_the_scene_depth() {
+        let shader = compose_with(DEPTH, READS_DEPTH).unwrap();
+        assert!(shader.contains("var horizon_pipeline_scene_depth: texture_depth_2d"));
+        assert!(
+            compose(DEPTH)
+                .unwrap_err()
+                .contains("RenderPipeline::reads_scene_depth")
+        );
+        assert!(!compose(GLOW).unwrap().contains("@group(2)"));
+        let both = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * pipeline_scene_depth(input); }";
+        let textured_and_depth = Features {
+            textured: true,
+            scene_depth: true,
+        };
+        assert!(compose_with(both, textured_and_depth).is_ok());
+        let own = format!("@group(2) @binding(2) var<uniform> mine: f32;\n{DEPTH}");
+        assert!(
+            compose_with(&own, READS_DEPTH)
+                .unwrap_err()
+                .contains("declares a binding")
+        );
+
+        let registered = [
+            pipeline("example:depth", "example:depth").reads_scene_depth(),
+            pipeline("example:flat", "example:depth").optional(),
+        ];
+        let set = Pipelines::build(&registered, 1, |_| Ok(DEPTH.to_owned())).unwrap();
+        assert!(set.built()[0].as_ref().unwrap().scene_depth);
+        assert!(set.built()[1].is_none(), "not registered to read it");
+        let glow = Pipelines::build(&registered[..1], 2, |_| Ok(GLOW.to_owned())).unwrap();
+        assert!(
+            glow.built()[0].as_ref().unwrap().scene_depth,
+            "the registration decides, not the file"
+        );
+    }
+
+    /// Every pipeline's input has its fragment's pixel, its place in the view and which side of
+    /// the quad it is.
+    #[test]
+    fn the_input_has_the_pixel_the_place_and_the_side() {
+        let side = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return vec4<f32>(input.pixel / frame.viewport + input.screen, select(0.0, 1.0, input.front_facing), 1.0);
+}";
+        assert!(compose(side).is_ok(), "{:?}", compose(side));
     }
 
     /// Sprites are named as the 2D atlas names them; an id naming a file is refused by name,

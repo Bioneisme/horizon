@@ -6,7 +6,8 @@ fn id(text: &str) -> Identifier {
     Identifier::parse(text).unwrap()
 }
 
-/// The pipelines a mod registers: a mod's sprite, a vanilla item sprite, and one untextured.
+/// The pipelines a mod registers: a mod's sprite, a vanilla item sprite, and one untextured that
+/// reads the scene depth.
 fn pipelines() -> [RenderPipeline; 3] {
     let pipeline = |name: &str| {
         RenderPipeline::new(
@@ -21,7 +22,7 @@ fn pipelines() -> [RenderPipeline; 3] {
         pipeline("wire_test:glow")
             .textured(PipelineTexture::Sprite(id("minecraft:item/diamond")))
             .optional(),
-        pipeline("wire_test:plain"),
+        pipeline("wire_test:plain").reads_scene_depth(),
     ]
 }
 
@@ -120,6 +121,11 @@ fn a_wasm_mods_textured_pipelines_reach_the_host_as_a_native_mods_do() {
                 assert_eq!(
                     registered.iter().map(|p| p.optional).collect::<Vec<_>>(),
                     [false, true, false],
+                    "guest {guest}"
+                );
+                assert_eq!(
+                    registered.iter().map(|p| p.scene_depth).collect::<Vec<_>>(),
+                    [false, false, true],
                     "guest {guest}"
                 );
                 assert!(registered.iter().all(|p| p.owner() == "wire_test"));

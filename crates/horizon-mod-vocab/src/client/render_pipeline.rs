@@ -30,6 +30,8 @@ pub struct RenderPipeline {
     /// What the shader samples with `pipeline_texture(uv)`, if anything ([`Self::textured`]).
     /// `None`, the default, binds no texture: the shader reads only its input and `frame`.
     pub texture: Option<PipelineTexture>,
+    /// Whether the shader reads the opaque scene's depth ([`Self::reads_scene_depth`]).
+    pub scene_depth: bool,
 }
 impl RenderPipeline {
     /// Describe a required pipeline that draws [`PipelineVertexFormat::PositionTexColor`]
@@ -49,6 +51,7 @@ impl RenderPipeline {
             depth,
             optional: false,
             texture: None,
+            scene_depth: false,
         }
     }
     /// The owning mod, assigned by the host after registration.
@@ -70,6 +73,17 @@ impl RenderPipeline {
     /// [`RenderPipelineError::Invalid`].
     pub fn textured(mut self, texture: PipelineTexture) -> Self {
         self.texture = Some(texture);
+        self
+    }
+
+    /// Let the shader read the depth of the opaque world, terrain without its translucent
+    /// layers, at its pixel: `pipeline_scene_depth`, `pipeline_scene_position` and
+    /// `pipeline_scene_distance`, for geometry a mod traces or places itself (ray marching,
+    /// volumes, decals). The game copies the depth once a frame, after the opaque terrain, and
+    /// only when such a pipeline draws: at `AfterSky` everything reads as sky, and from
+    /// `AfterOpaqueBlocks` on the copy holds the opaque terrain, never later draws.
+    pub fn reads_scene_depth(mut self) -> Self {
+        self.scene_depth = true;
         self
     }
 }
