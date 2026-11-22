@@ -28,6 +28,7 @@ horizon_client_render::bluemap::Settings  kind=struct  #19554
 horizon_client_render::bluemap::Slot  kind=enum  #19554
 horizon_client_render::bluemap::State  kind=struct  #19554
 horizon_client_render::bluemap::Tile  kind=struct  #19554
+horizon_client_render::gfx::mod_pipelines::Compiled  kind=type  #19057
 horizon_client::game::points  #19576
 horizon_client::game::points::host_side  #19576
 horizon_client::game::points::mirror_in  #19576

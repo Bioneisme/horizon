@@ -6,6 +6,7 @@
 //! never while quads are being submitted, so a required pipeline the GPU refuses fails that
 //! load's renderer and the reload with it.
 
+use super::frame_targets::Kind;
 use super::world_primitives::Upload;
 use crate::mod_pipelines::{Built, BuiltTexture, FRAGMENT_ENTRY, Pipelines, VERTEX_ENTRY};
 use glam::Mat4;
@@ -531,15 +532,22 @@ impl ModPipelines {
         }
         let size = depth.size();
         if self.scene.as_ref().is_none_or(|s| s.texture.size() != size) {
-            let texture = depth_texture(
-                device,
-                [size.width, size.height],
-                wgpu::TextureUsages::COPY_DST,
-            );
-            let group = depth_group(device, &self.depth_layout, &texture, &self.inverse);
-            self.scene = Some(SceneDepth { texture, group });
+            // The old copy goes first, so the two are never held together. Without the room for
+            // the new one nothing invalid is kept: this frame reads sky and the next tries again.
+            self.scene = None;
+            self.scene = super::frame_targets::made(device, Kind::SceneDepth, || {
+                let texture = depth_texture(
+                    device,
+                    [size.width, size.height],
+                    wgpu::TextureUsages::COPY_DST,
+                );
+                let group = depth_group(device, &self.depth_layout, &texture, &self.inverse);
+                SceneDepth { texture, group }
+            });
         }
-        let scene = self.scene.as_ref().expect("made above");
+        let Some(scene) = &self.scene else {
+            return;
+        };
         encoder.copy_texture_to_texture(depth.as_image_copy(), scene.texture.as_image_copy(), size);
         self.copied = true;
     }
@@ -1402,6 +1410,51 @@ mod tests {
             !primitives.pipelines.wants_scene_depth(),
             "AfterSky alone needs no copy"
         );
+    }
+
+    /// Without the video memory for the copy, the frame's depth-reading pipelines read sky and
+    /// nothing invalid is kept: the next frame makes the copy and reads the wall.
+    #[test]
+    fn a_scene_depth_copy_without_room_reads_sky_and_is_made_again() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let reads = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return select(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0), pipeline_scene_depth(input) > 0.0);
+}";
+        let id = Identifier::parse("test:p0").unwrap();
+        let registered = [RenderPipeline::new(
+            id.clone(),
+            id,
+            PipelineBlend::Translucent,
+            WorldDepth::ThroughWalls,
+        )
+        .reads_scene_depth()];
+        let set = Pipelines::build(&registered, 5, |_| Ok(reads.to_owned())).unwrap();
+        let vertices = quad([0.0, 0.0, 64.0, 64.0], 2.0, [255; 4]);
+        let runs = [PipelineRun {
+            slot: 0,
+            stage: 1,
+            quads: 1,
+        }];
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            time: 0.0,
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let (sky, wall) = ([255.0, 0.0, 0.0, 255.0], [0.0, 255.0, 0.0, 255.0]);
+        crate::gfx::frame_targets::NO_ROOM.set(1);
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        crate::gfx::frame_targets::NO_ROOM.set(0);
+        assert_near(at(32, 32), sky, 0.0, "no room for the copy: the sky");
+        assert!(primitives.pipelines.scene.is_none(), "nothing kept");
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        assert_near(at(32, 32), wall, 0.0, "the next frame makes it");
     }
 
     /// `input.front_facing` is true on the side a quad's corners run top left, bottom left,
