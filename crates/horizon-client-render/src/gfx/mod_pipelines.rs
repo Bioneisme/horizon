@@ -118,6 +118,9 @@ struct Compiled {
 struct SceneDepth {
     texture: wgpu::Texture,
     group: wgpu::BindGroup,
+    /// Made under `frame_targets::made`'s own scopes. A scaled screenshot's frame makes it
+    /// without them (its own scopes catch a failure), so the next window frame makes it again.
+    checked: bool,
 }
 
 /// The pipelines and the buffer that draw a [`Batch`].
@@ -690,7 +693,12 @@ impl ModPipelines {
             return;
         }
         let size = depth.size();
-        if self.scene.as_ref().is_none_or(|s| s.texture.size() != size) {
+        let checked = !super::frame_targets::screenshot_frame();
+        if self
+            .scene
+            .as_ref()
+            .is_none_or(|s| s.texture.size() != size || (checked && !s.checked))
+        {
             // The old copy goes first, so the two are never held together. Without the room for
             // the new one nothing invalid is kept: this frame reads sky and the next tries again.
             self.scene = None;
@@ -701,7 +709,11 @@ impl ModPipelines {
                     wgpu::TextureUsages::COPY_DST,
                 );
                 let group = depth_group(device, &self.depth_layout, &texture, &self.inverse);
-                SceneDepth { texture, group }
+                SceneDepth {
+                    texture,
+                    group,
+                    checked,
+                }
             });
         }
         let Some(scene) = &self.scene else {
@@ -1773,6 +1785,30 @@ mod tests {
         assert!(primitives.pipelines.scene.is_none(), "nothing kept");
         let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
         assert_near(at(32, 32), wall, 0.0, "the next frame makes it");
+
+        // A scaled screenshot's frame makes it unchecked (its own scopes catch a failure), so
+        // the next window frame makes it again rather than keep what may be invalid.
+        primitives.pipelines.scene = None;
+        let at = crate::gfx::frame_targets::in_screenshot(|| {
+            render(&gpu, &mut primitives, format, batch, STAGES - 1)
+        });
+        assert_near(at(32, 32), wall, 0.0, "the screenshot reads the wall");
+        assert!(
+            primitives
+                .pipelines
+                .scene
+                .as_ref()
+                .is_some_and(|s| !s.checked)
+        );
+        drop(render(&gpu, &mut primitives, format, batch, STAGES - 1));
+        assert!(
+            primitives
+                .pipelines
+                .scene
+                .as_ref()
+                .is_some_and(|s| s.checked),
+            "made again, checked, by the next window frame"
+        );
     }
 
     /// `input.front_facing` is true on the side a quad's corners run top left, bottom left,
