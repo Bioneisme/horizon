@@ -32,6 +32,10 @@ pub struct PipelineRun {
     /// The stage it draws at (`RenderLevelStage::ALL`'s index).
     pub stage: u32,
     pub quads: u32,
+    /// Each quad covers the whole view ([`mod_api::WorldDrawContext::pipeline_screen`]): the
+    /// renderer places its corners on the near plane of the frame's own view, and keeps the
+    /// texture coordinates and colour queued.
+    pub screen: bool,
 }
 
 /// A write of a frame into a pipeline's buffer ([`mod_api::WorldDrawContext::write_pipeline_buffer`]),
@@ -75,6 +79,22 @@ struct Run {
     slot: usize,
     stage: usize,
     quads: std::ops::Range<u32>,
+}
+
+/// The depth a screen draw lies at, reversed: just past the near plane (1), so nothing the world
+/// draws is in front of it, and far enough inside it that its corners, taken back through the
+/// view and projected again, never leave the depth range.
+const SCREEN_DEPTH: f32 = 0.999;
+
+/// The corners of a quad over the whole view, in the order quads give them (top left, bottom
+/// left, bottom right, top right), in blocks relative to the camera: where `inverse`, the
+/// inverse of the jittered view, puts the view's corners at [`SCREEN_DEPTH`].
+fn screen_corners(inverse: Mat4) -> [[f32; 3]; 4] {
+    [[-1.0, 1.0], [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0]].map(|[x, y]| {
+        inverse
+            .project_point3(glam::Vec3::new(x, y, SCREEN_DEPTH))
+            .to_array()
+    })
 }
 
 /// Where textured pipelines' textures come from when the renderer builds them
@@ -684,13 +704,37 @@ impl ModPipelines {
             });
         }
         upload(&self.vertices, 0, bytes);
+        // A screen draw's corners, which only this frame's view knows, over those queued.
+        let inverse = view_proj.inverse();
+        let corners = screen_corners(inverse);
+        let stride = std::mem::size_of::<PipelineVertex>();
+        let mut next = 0;
+        for run in batch.runs {
+            let queued = next..next + run.quads;
+            next = queued.end;
+            if !run.screen || queued.end > quads {
+                continue;
+            }
+            for quad in queued {
+                let at = quad as usize * 4;
+                let placed: [PipelineVertex; 4] = std::array::from_fn(|corner| PipelineVertex {
+                    pos: corners[corner],
+                    ..batch.vertices[at + corner]
+                });
+                upload(
+                    &self.vertices,
+                    (at * stride) as u64,
+                    bytemuck::cast_slice(&placed),
+                );
+            }
+        }
         upload(
             &self.view,
             0,
             bytemuck::cast_slice(&view_proj.to_cols_array()),
         );
         if self.runs.iter().any(|run| self.reads_depth(run.slot)) {
-            let inverse = view_proj.inverse().to_cols_array();
+            let inverse = inverse.to_cols_array();
             upload(&self.inverse, 0, bytemuck::cast_slice(&inverse));
         }
         upload(
@@ -1338,7 +1382,12 @@ mod tests {
             quad([32.0, 32.0, 64.0, 64.0], 2.0, white),
         ]
         .concat();
-        let run = |slot, stage, quads| PipelineRun { slot, stage, quads };
+        let run = |slot, stage, quads| PipelineRun {
+            slot,
+            stage,
+            quads,
+            screen: false,
+        };
         let runs = [run(0, 0, 2), run(1, 2, 1), run(3, 0, 1), run(4, 0, 1)];
         let batch = Batch {
             set: Some(&set),
@@ -1422,6 +1471,7 @@ mod tests {
             slot: 0,
             stage: 4,
             quads: 1,
+            screen: false,
         }];
         let format = wgpu::TextureFormat::Rgba16Float;
         let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
@@ -1557,6 +1607,7 @@ mod tests {
             slot,
             stage: 4,
             quads: 1,
+            screen: false,
         });
         let pixel = render(
             &gpu,
@@ -1620,6 +1671,7 @@ mod tests {
             slot: 0,
             stage,
             quads: 1,
+            screen: false,
         };
         // The top half at AfterSky, the bottom half at AfterOpaqueBlocks.
         let runs = [run(0), run(1)];
@@ -1764,6 +1816,7 @@ mod tests {
             slot,
             stage: 1,
             quads: 1,
+            screen: false,
         });
         let batch = Batch {
             set: Some(&set),
@@ -1804,6 +1857,7 @@ mod tests {
             slot: 0,
             stage: 1,
             quads: 1,
+            screen: false,
         }];
         let batch = Batch {
             set: Some(&set),
@@ -1872,6 +1926,7 @@ mod tests {
             slot: 0,
             stage: 4,
             quads: 2,
+            screen: false,
         }];
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
@@ -1918,6 +1973,7 @@ mod tests {
             slot: 0,
             stage: 4,
             quads: 1,
+            screen: false,
         }];
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
@@ -2065,11 +2121,13 @@ mod tests {
                 slot: 0,
                 stage: 4,
                 quads: 1,
+                screen: false,
             },
             PipelineRun {
                 slot: 1,
                 stage: 4,
                 quads: 3,
+                screen: false,
             },
         ];
         let batch = Batch {
@@ -2200,5 +2258,175 @@ mod tests {
         );
         assert!(set.resolve(&id("test:one")).is_ok());
         assert!(set.resolve(&id("test:plain")).is_ok());
+    }
+
+    /// A screen draw as the game queues it (`WorldGeometry::pipeline_screen`): corners for the
+    /// renderer to place, texture coordinates 0 to 1 from the top left, white.
+    fn screen() -> [PipelineVertex; 4] {
+        [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]].map(|uv| PipelineVertex {
+            pos: [0.0; 3],
+            uv,
+            color: !0,
+        })
+    }
+
+    /// A screen draw covers every pixel of the view, in front of the wall 5 blocks ahead though
+    /// it tests depth, and hands each pixel the ray through its centre: `normalize(position)`
+    /// is the ray's direction, the scene distance is the wall's along it, and `uv` runs 0 to 1
+    /// from the top left.
+    #[test]
+    fn a_screen_draw_covers_the_view_and_hands_each_pixel_its_ray() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        // Red and green: the ray's x and y from -1 to 1 as 0 to 1; blue: the scene distance in
+        // tens of blocks.
+        let ray = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    let ray = normalize(input.position);
+    return vec4<f32>(ray.xy * 0.5 + 0.5, pipeline_scene_distance(input) / 10.0, 1.0);
+}";
+        let uv = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    return vec4<f32>(input.uv, 0.0, 1.0);
+}";
+        let id = |name: &str| Identifier::parse(name).unwrap();
+        let registered = [
+            RenderPipeline::new(
+                id("test:ray"),
+                id("test:ray"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            )
+            .reads_scene_depth(),
+            RenderPipeline::new(
+                id("test:uv"),
+                id("test:uv"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            ),
+        ];
+        let set = Pipelines::build(&registered, 9, |file| {
+            Ok(if file.ends_with("ray.wgsl") { ray } else { uv }.to_owned())
+        })
+        .unwrap();
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let vertices = screen();
+        let mut drawn = |slot| {
+            let runs = [PipelineRun {
+                slot,
+                stage: 1,
+                quads: 1,
+                screen: true,
+            }];
+            let batch = Batch {
+                set: Some(&set),
+                vertices: &vertices,
+                runs: &runs,
+                ..Default::default()
+            };
+            render(&gpu, &mut primitives, format, batch, STAGES - 1)
+        };
+
+        let at = drawn(0);
+        let inverse = view_proj().inverse();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let wall = inverse.project_point3(Vec3::new(
+                    (x as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0,
+                    1.0 - (y as f32 + 0.5) / SIZE as f32 * 2.0,
+                    wall(),
+                ));
+                let ray = wall.normalize();
+                assert_near(
+                    at(x, y),
+                    [
+                        stored(ray.x * 0.5 + 0.5),
+                        stored(ray.y * 0.5 + 0.5),
+                        stored(wall.length() / 10.0),
+                        1.0,
+                    ],
+                    0.004,
+                    &format!("pixel ({x}, {y}), its ray {ray}"),
+                );
+            }
+        }
+        // The centre looks straight ahead.
+        let centre = inverse
+            .project_point3(Vec3::new(0.0, 0.0, wall()))
+            .normalize();
+        assert!(centre.abs_diff_eq(Vec3::NEG_Z, 1e-5), "{centre}");
+
+        let at = drawn(1);
+        let half = 0.5 / SIZE as f32;
+        assert_near(
+            at(0, 0),
+            [stored(half), stored(half), 0.0, 1.0],
+            0.004,
+            "top left",
+        );
+        assert_near(
+            at(SIZE - 1, SIZE - 1),
+            [stored(1.0 - half), stored(1.0 - half), 0.0, 1.0],
+            0.004,
+            "bottom right",
+        );
+    }
+
+    /// Where a quad 6000 blocks away is cut by the far plane (512 blocks here), a screen draw
+    /// that reaches as far along its rays still draws: it lies on the near plane.
+    #[test]
+    fn a_screen_draw_is_not_cut_by_the_far_plane() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        // Green where the opaque world is farther than 6000 blocks along the ray: over the sky.
+        let far = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    let reached = pipeline_scene_distance(input) > 6000.0;
+    return vec4<f32>(0.0, select(0.0, 1.0, reached), 0.0, input.color.a);
+}";
+        let id = Identifier::parse("test:p0").unwrap();
+        let registered = [RenderPipeline::new(
+            id.clone(),
+            id,
+            PipelineBlend::Translucent,
+            WorldDepth::Tested,
+        )
+        .reads_scene_depth()];
+        let set = Pipelines::build(&registered, 4, |_| Ok(far.to_owned())).unwrap();
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let clear = CLEAR as f32;
+        let mut drawn = |vertices: &[PipelineVertex], screen: bool| {
+            let runs = [PipelineRun {
+                slot: 0,
+                stage: 1,
+                quads: 1,
+                screen,
+            }];
+            let batch = Batch {
+                set: Some(&set),
+                vertices,
+                runs: &runs,
+                ..Default::default()
+            };
+            render_over(&gpu, &mut primitives, format, batch, STAGES - 1, 0.0)(32, 32)
+        };
+        let quad = quad([0.0, 0.0, 64.0, 64.0], 6000.0, [255; 4]);
+        assert_near(
+            drawn(&quad, false),
+            [clear, clear, clear, 1.0],
+            0.004,
+            "a quad 6000 blocks away is cut",
+        );
+        assert_near(
+            drawn(&screen(), true),
+            [0.0, 1.0, 0.0, 1.0],
+            0.004,
+            "a screen draw reaching 6000 blocks",
+        );
     }
 }

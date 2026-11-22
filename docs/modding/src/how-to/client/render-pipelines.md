@@ -113,10 +113,47 @@ pipeline that cannot be built does.
 
 ## What a pipeline draws, and when
 
-`pipeline_quads` works wherever a `WorldDrawContext` is given: `submit_custom_geometry` and each
-`render_level_stage`. Within a stage, pipeline quads draw after that stage's plain quads and
-lines, in the order submitted. Under a shader pack they follow the plain quads: a stage the pack
+`pipeline_quads` and `pipeline_screen` work wherever a `WorldDrawContext` is given:
+`submit_custom_geometry` and each `render_level_stage`. Within a stage, pipeline quads draw after
+that stage's plain quads and lines, in the order submitted. Under a shader pack they follow the plain quads: a stage the pack
 draws itself is drawn with the next stage the game reaches.
+
+## Drawing over the whole view
+
+For an effect that covers the view (fog, a sky layer, a cloud or volume the shader marches through),
+draw the pipeline once over the whole view in place of placing quads:
+
+```rust,ignore
+event.draw.pipeline_screen(clouds)?;
+```
+
+It draws at the current stage, in the order submitted among that stage's pipeline quads, and
+counts as one quad of the view's 4,096. The quad lies on the view's near plane: the far plane never cuts it,
+however far the shader reaches, and it passes `WorldDepth::Tested`'s test everywhere, so the shader
+decides where the world stops it. Its `pipeline_fragment` gets:
+
+| Field | Value |
+| --- | --- |
+| `position` | A point on the pixel's ray just past the near plane, in blocks relative to the camera: `normalize(input.position)` is the ray's direction. |
+| `uv` | 0 to 1 across the view, from the top left. |
+| `color` | White. |
+| `pixel`, `screen` | As for a quad. |
+
+```wgsl
+fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
+    let ray = normalize(input.position);
+    // A cloud layer at 6000 blocks up, stopped by the terrain in front of it.
+    let along = (6000.0 - camera_height) / ray.y; // the mod's own camera height, from a buffer
+    if ray.y <= 0.0 || along > pipeline_scene_distance(input) {
+        discard;
+    }
+    return vec4(vec3(1.0), 0.6);
+}
+```
+
+With [`reads_scene_depth`](#reading-the-scene-depth) the shader stops its rays at the terrain. A
+pipeline that [writes depth](#writing-depth) can draw over the view too; the point it returns must
+still lie within the view's depth range, or that fragment draws nothing.
 
 ## Your own data
 

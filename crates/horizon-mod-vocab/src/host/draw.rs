@@ -477,6 +477,17 @@ pub trait WorldDrawContext {
     ) -> Result<(), PipelineDrawError> {
         unimplemented!("WorldDrawContext::pipeline_quads")
     }
+    /// Draw the mod pipeline `pipeline` once over the whole view, at the current stage, as one
+    /// quad of the per-view capacity. It lies on the near plane, so the far plane never cuts it
+    /// and it passes a depth test against the world: a shader that marches along its rays stops
+    /// them itself, at `pipeline_scene_distance` when its pipeline
+    /// [reads the scene depth](crate::RenderPipeline::reads_scene_depth). Its shader gets
+    /// `position`, a point on the pixel's ray just past the near plane
+    /// (`normalize(input.position)` is the ray), `uv` from 0 to 1 from the top left and white.
+    /// On `Err`, nothing is drawn.
+    fn pipeline_screen(&mut self, pipeline: RenderPipelineRef) -> Result<(), PipelineDrawError> {
+        unimplemented!("WorldDrawContext::pipeline_screen")
+    }
     /// Write `bytes` into `pipeline`'s buffer at place `buffer` among those it registered with
     /// [`RenderPipeline::reads_buffer`](crate::RenderPipeline::reads_buffer) (the first is 0),
     /// from byte `offset`. The rest of the buffer keeps what it held, frame to frame, so write

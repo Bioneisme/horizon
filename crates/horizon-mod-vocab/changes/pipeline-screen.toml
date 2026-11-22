@@ -1,0 +1,3 @@
+ids = ["method:WorldDrawContext::pipeline_screen"]
+why = "A mod render pipeline can draw once over the whole view (WorldDrawContext::pipeline_screen), at the current stage, as one quad of the view's capacity: the quad lies on the near plane, so the far plane never cuts it and it passes the world's depth test, and its shader gets a point on each pixel's ray (normalize(input.position) is the ray). Sky, fog and volume effects that march along the view's rays no longer need a camera-facing quad that the far plane clips."
+migrate = "Additive. Existing pipelines and pipeline_quads are unchanged."

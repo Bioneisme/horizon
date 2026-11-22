@@ -322,16 +322,40 @@ impl WorldGeometry {
                     color,
                 }));
         }
-        let (stage, count) = (self.stage as u32, quads.len() as u32);
+        self.join_run(slot, quads.len() as u32, false);
+        Ok(())
+    }
+    /// Queue one quad over the whole view, drawn by the mod pipeline in `slot`, or refuse it with
+    /// no room left. Its corners wait for the renderer, which knows the frame's view; it keeps the
+    /// texture coordinates (0 to 1 from the top left) and the colour (white) given here.
+    pub fn pipeline_screen(&mut self, slot: u32) -> Result<(), PipelineDrawError> {
+        if self.usage().quads >= CAPACITY {
+            return Err(PipelineDrawError::CapacityExceeded);
+        }
+        let uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+        self.pipeline_quads.extend(uv.map(|uv| PipelineVertex {
+            pos: [0.0; 3],
+            uv,
+            color: !0,
+        }));
+        self.join_run(slot, 1, true);
+        Ok(())
+    }
+    /// Count `quads` just queued for the pipeline in `slot` at the current stage: they join the
+    /// last run when it has the same pipeline, stage and kind, to keep the order submitted.
+    fn join_run(&mut self, slot: u32, quads: u32, screen: bool) {
+        let stage = self.stage as u32;
         match self.pipeline_runs.last_mut() {
-            Some(run) if run.slot == slot && run.stage == stage => run.quads += count,
+            Some(run) if run.slot == slot && run.stage == stage && run.screen == screen => {
+                run.quads += quads;
+            }
             _ => self.pipeline_runs.push(PipelineRun {
                 slot,
                 stage,
-                quads: count,
+                quads,
+                screen,
             }),
         }
-        Ok(())
     }
     /// Queue a write of `bytes` from byte `offset` into buffer `buffer` of the mod pipeline in
     /// `slot`, whose buffers have `sizes`, or refuse it whole: no such buffer, past its end, an
@@ -705,7 +729,12 @@ mod tests {
         draw.pipeline_quads(4, &[]).unwrap();
 
         let pipelines = draw.batch().pipelines;
-        let run = |slot, stage, quads| PipelineRun { slot, stage, quads };
+        let run = |slot, stage, quads| PipelineRun {
+            slot,
+            stage,
+            quads,
+            screen: false,
+        };
         assert_eq!(
             pipelines.runs,
             [run(4, 0, 3), run(1, 0, 1), run(4, 0, 1), run(4, 3, 1)]
@@ -759,6 +788,67 @@ mod tests {
             ),
             "a view's pipeline quads never grow the storage reserved at setup"
         );
+    }
+
+    #[test]
+    fn a_screen_draw_counts_one_quad_and_keeps_its_stage() {
+        use RenderLevelStage::*;
+        let mut draw = WorldGeometry::default();
+        draw.reset([100.0, 64.0, -5.0], Mat4::IDENTITY, [0.5, 0.5]);
+        let quad = PipelineQuad::spanning(
+            [
+                [100.0, 65.0, -6.0],
+                [100.0, 64.0, -6.0],
+                [101.0, 64.0, -6.0],
+                [101.0, 65.0, -6.0],
+            ],
+            !0,
+        );
+        draw.begin_stage(AfterOpaqueBlocks);
+        draw.pipeline_quads(2, &[quad]).unwrap();
+        draw.pipeline_screen(2).unwrap();
+        draw.pipeline_screen(2).unwrap();
+        draw.begin_stage(AfterTranslucentBlocks);
+        draw.pipeline_screen(2).unwrap();
+        draw.pipeline_quads(2, &[quad]).unwrap();
+
+        let pipelines = draw.batch().pipelines;
+        let run = |stage, quads, screen| PipelineRun {
+            slot: 2,
+            stage,
+            quads,
+            screen,
+        };
+        // A screen draw never joins quads of its pipeline, nor quads a screen draw: the renderer
+        // places a screen run's corners itself.
+        assert_eq!(
+            pipelines.runs,
+            [
+                run(1, 1, false),
+                run(1, 2, true),
+                run(2, 1, true),
+                run(2, 1, false),
+            ]
+        );
+        assert_eq!(draw.usage().quads, 5);
+        // The screen's corners as the pipeline sees them: top left first, front facing, its
+        // texture coordinates 0 to 1 from the top left, in white.
+        let screen = &pipelines.vertices[4..8];
+        assert_eq!(
+            screen.iter().map(|v| v.uv).collect::<Vec<_>>(),
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]
+        );
+        assert!(screen.iter().all(|v| v.color == !0));
+
+        // One quad of the view's capacity: refused with no room left, and nothing queued.
+        let plain = WorldQuad::new(quad.corners, !0, WorldDepth::Tested);
+        draw.quads(&vec![plain; CAPACITY as usize - 5]).unwrap();
+        assert_eq!(
+            draw.pipeline_screen(2),
+            Err(PipelineDrawError::CapacityExceeded)
+        );
+        assert_eq!(draw.batch().pipelines.runs.len(), 4);
+        assert_eq!(draw.usage().quads, CAPACITY);
     }
 
     struct NearX;

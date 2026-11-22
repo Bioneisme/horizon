@@ -127,6 +127,21 @@ impl Game<'_> {
             .map_err(PipelineDrawError::Pipeline)?;
         draw.pipeline_quads(slot, quads)
     }
+    /// Queue one draw of a mod pipeline over the whole view, or refuse it: the handle is checked
+    /// against the published pipelines, then the view's room for one quad.
+    pub(super) fn native_world_draw_pipeline_screen(
+        &self,
+        draw: &mut WorldGeometry,
+        pipeline: RenderPipelineRef,
+    ) -> Result<(), PipelineDrawError> {
+        let slot = self
+            .pack
+            .render
+            .mod_pipelines
+            .slot(pipeline)
+            .map_err(PipelineDrawError::Pipeline)?;
+        draw.pipeline_screen(slot)
+    }
     /// Queue a write into a mod pipeline's buffer, or refuse it whole: the handle is checked
     /// against the published pipelines, the place and range against its buffers.
     pub(super) fn native_world_draw_write_pipeline_buffer(
