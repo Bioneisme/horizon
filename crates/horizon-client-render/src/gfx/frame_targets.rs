@@ -75,6 +75,12 @@ pub(crate) fn in_screenshot<T>(draw: impl FnOnce() -> T) -> T {
     drawn
 }
 
+/// Whether a scaled screenshot's frame is being drawn ([`in_screenshot`]): what `made` makes then
+/// is unchecked, so a target kept past the frame is made again by the next window frame.
+pub(crate) fn screenshot_frame() -> bool {
+    SCREENSHOT.get()
+}
+
 /// A window frame begins: no `made` in it has found no room yet.
 pub(crate) fn begin_frame() {
     OUT_OF_MEMORY.set(false);
