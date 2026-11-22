@@ -68,11 +68,11 @@ pub struct TextureSources<'a> {
     pub sprite: &'a dyn Fn(&str) -> Option<[f32; 4]>,
 }
 
-/// A built pipeline, with its texture's bind group (group 1) when it is textured.
+/// A built pipeline, with its texture's bind group (group 2) when it is textured.
 struct Compiled {
     pipeline: wgpu::RenderPipeline,
     texture: Option<wgpu::BindGroup>,
-    /// It binds the scene depth in group 2.
+    /// It binds the scene depth in group 1.
     scene_depth: bool,
 }
 
@@ -93,7 +93,7 @@ pub struct ModPipelines {
     depth_layout: wgpu::BindGroupLayout,
     /// The inverse of the jittered view, which the scene depth functions read.
     inverse: wgpu::Buffer,
-    /// Group 2 over a depth of 0 everywhere: before the copy, and on a frame without one.
+    /// Group 1 over a depth of 0 everywhere: before the copy, and on a frame without one.
     sky: wgpu::BindGroup,
     /// What the last copy went into, sized as its source.
     scene: Option<SceneDepth>,
@@ -170,16 +170,17 @@ impl ModPipelines {
                 uniform(1, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        // Group 1 is left out of a pipeline that has no texture, as group 2 is of one that
-        // doesn't read the depth.
+        // Group 1, the depth every reader shares, is left out of a pipeline that doesn't read it,
+        // as group 2 is of one that has no texture. What differs between pipelines comes last, so
+        // a switch between two depth readers never disturbs the depth's binding.
         let layouts = [0, 1, 2, 3].map(|index| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Mod pipelines"),
                 bind_group_layouts: &[
                     Some(&group_layout),
-                    (index & 1 != 0).then_some(&texture_layout),
                     (index & 2 != 0).then_some(&depth_layout),
-                ][..if index & 2 != 0 { 3 } else { 1 + index }],
+                    (index & 1 != 0).then_some(&texture_layout),
+                ][..if index & 1 != 0 { 3 } else { 1 + index / 2 }],
                 ..Default::default()
             })
         });
@@ -554,7 +555,7 @@ impl ModPipelines {
 
     /// Draws the prepared runs of stages `first..=last` in the order queued, with `indices`
     /// (6 a quad, `u32`). Leaves the pass with its own pipeline, bind group 0 and buffers, bind
-    /// group 1 after a textured pipeline and bind group 2 after one that reads the depth.
+    /// group 1 after a pipeline that reads the depth and bind group 2 after a textured one.
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -584,12 +585,12 @@ impl ModPipelines {
             pass.set_pipeline(pipeline);
             // Only a textured pipeline has group 1; the others draw as they did before it.
             if let Some(texture) = texture {
-                pass.set_bind_group(1, texture, &[]);
+                pass.set_bind_group(2, texture, &[]);
             }
             // At `AfterSky`, and on a frame that took no copy, the depth is the sky's.
             if *scene_depth {
                 let scene = self.scene.as_ref().filter(|_| self.copied && run.stage > 0);
-                pass.set_bind_group(2, scene.map_or(&self.sky, |s| &s.group), &[]);
+                pass.set_bind_group(1, scene.map_or(&self.sky, |s| &s.group), &[]);
             }
             pass.draw_indexed(run.quads.start * 6..run.quads.end * 6, 0, 0..1);
         }
@@ -623,7 +624,7 @@ fn depth_texture(
     })
 }
 
-/// Group 2 over `depth`, with the inverse view.
+/// Group 1 over `depth`, with the inverse view.
 fn depth_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -1410,6 +1411,106 @@ mod tests {
             !primitives.pipelines.wants_scene_depth(),
             "AfterSky alone needs no copy"
         );
+    }
+
+    /// A depth-reading pipeline drawn right after a textured one in the same pass still reads
+    /// the scene depth: switching pipelines whose texture groups differ keeps the depth bound.
+    #[test]
+    fn a_depth_reader_after_a_textured_one_still_reads_the_depth() {
+        use mod_api::PipelineTexture;
+        use wgpu::util::DeviceExt;
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let (device, queue) = (&gpu.0, &gpu.1);
+        // Green over the wall, red over the sky; the textured one adds its white texel's nothing.
+        let wall = "vec4<f32>(0.0, 1.0, 0.0, 1.0), pipeline_scene_depth(input) > 0.0)";
+        let textured = format!(
+            "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {{
+    return pipeline_texture(input.uv) * 0.0 + select(vec4<f32>(1.0, 0.0, 0.0, 1.0), {wall};
+}}"
+        );
+        let plain = format!(
+            "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {{
+    return select(vec4<f32>(1.0, 0.0, 0.0, 1.0), {wall};
+}}"
+        );
+        let id = |slot: usize| Identifier::parse(&format!("test:p{slot}")).unwrap();
+        let pipeline = |slot| {
+            RenderPipeline::new(
+                id(slot),
+                id(slot),
+                PipelineBlend::Translucent,
+                WorldDepth::ThroughWalls,
+            )
+            .reads_scene_depth()
+        };
+        let registered = [
+            pipeline(0).textured(PipelineTexture::Sprite(id(0))),
+            pipeline(1),
+        ];
+        let set = Pipelines::build(&registered, 9, |file| {
+            Ok(if file.ends_with("p0.wgsl") {
+                &textured
+            } else {
+                &plain
+            }
+            .clone())
+        })
+        .unwrap();
+        let atlas = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[255; 4],
+        );
+        let atlas = atlas.create_view(&Default::default());
+        let sprite = |_: &str| Some([0.0, 0.0, 1.0, 1.0]);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(device, (format, false));
+        let sources = TextureSources {
+            atlas: &atlas,
+            sprite: &sprite,
+        };
+        primitives
+            .pipelines
+            .build(device, &set, Some(sources))
+            .unwrap();
+        let vertices = [
+            quad([0.0, 0.0, 32.0, 64.0], 2.0, [255; 4]),
+            quad([32.0, 0.0, 64.0, 64.0], 2.0, [255; 4]),
+        ]
+        .concat();
+        let runs = [0, 1].map(|slot| PipelineRun {
+            slot,
+            stage: 1,
+            quads: 1,
+        });
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            time: 0.0,
+        };
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        let green = [0.0, 255.0, 0.0, 255.0];
+        assert_near(at(16, 32), green, 0.0, "the textured reader");
+        assert_near(at(48, 32), green, 0.0, "the plain reader after it");
     }
 
     /// Without the video memory for the copy, the frame's depth-reading pipelines read sky and
