@@ -141,10 +141,14 @@ impl Game<'_> {
         let slot = pipelines
             .slot(pipeline)
             .map_err(PipelineDrawError::Pipeline)?;
-        let sizes = pipelines.built()[slot as usize]
-            .as_ref()
-            .map_or(&[][..], |built| built.buffers.as_slice());
-        draw.write_pipeline_buffer(slot, sizes, buffer, offset, bytes)
+        let Some(built) = pipelines.built()[slot as usize].as_ref() else {
+            return Err(PipelineDrawError::Pipeline(mod_api::RenderPipelineError::Invalid));
+        };
+        draw.write_pipeline_buffer(slot, &built.buffers, buffer, offset, bytes)?;
+        // Kept as it is queued, so a frame that never prepares it loses nothing.
+        let size = built.buffers[buffer as usize];
+        horizon_client::gfx::mod_pipelines::keep_write(&built.id, buffer, size, offset, bytes);
+        Ok(())
     }
     /// Queued counts and fixed capacities, shared by both depth modes and all listeners.
     /// Capacity is allocated during setup, never grown during submission.

@@ -87,16 +87,51 @@ pub struct TextureSources<'a> {
     pub sprite: &'a dyn Fn(&str) -> Option<[f32; 4]>,
 }
 
-/// What mods last wrote into their pipelines' buffers, by pipeline id and the buffer's place: the
-/// game's own copy, which outlives any renderer. A resource reload builds a new renderer, whose
-/// buffers start from it, and a frame given up before its uploads reached the GPU (#13624) has it
-/// uploaded again.
-static CONTENTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(String, u32), Vec<u8>>>,
-> = std::sync::LazyLock::new(Default::default);
+/// What mods wrote into their pipelines' buffers, kept by the game as each write is accepted
+/// ([`keep_write`]), outside any renderer.
+#[derive(Default)]
+struct Kept {
+    /// By pipeline id and the buffer's place.
+    bytes: std::collections::HashMap<(String, u32), Vec<u8>>,
+    /// How many writes were kept: a renderer whose frames uploaded fewer missed some.
+    writes: u64,
+}
 
-fn contents() -> std::sync::MutexGuard<'static, std::collections::HashMap<(String, u32), Vec<u8>>> {
+/// The kept writes. A renderer that missed some (a resource reload builds a new one, a frame
+/// returned before preparing its writes, or one was given up before its uploads reached the GPU,
+/// #13624) uploads every buffer from here before its next draw.
+static CONTENTS: std::sync::LazyLock<std::sync::Mutex<Kept>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn contents() -> std::sync::MutexGuard<'static, Kept> {
     CONTENTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keeps a write the game accepted into buffer `buffer` (`size` bytes) of pipeline `pipeline`,
+/// as it queues the write for the frame: the renderer uploads the queued write, or, if it missed
+/// any, every buffer as kept here.
+pub fn keep_write(
+    pipeline: &mod_api::Identifier,
+    buffer: u32,
+    size: u32,
+    offset: u32,
+    bytes: &[u8],
+) {
+    let mut kept = contents();
+    let at = offset as usize;
+    let Some(end) = at
+        .checked_add(bytes.len())
+        .filter(|&end| end <= size as usize)
+    else {
+        return;
+    };
+    let buffer = kept
+        .bytes
+        .entry((pipeline.to_string(), buffer))
+        .or_insert_with(|| vec![0; size as usize]);
+    buffer.resize(size as usize, 0);
+    buffer[at..end].copy_from_slice(bytes);
+    kept.writes += 1;
 }
 
 #[cfg(test)]
@@ -142,9 +177,10 @@ pub struct ModPipelines {
     buffers: Vec<Vec<wgpu::Buffer>>,
     /// Each slot's pipeline id, the key of its buffers' [`CONTENTS`].
     buffer_ids: Vec<Option<String>>,
-    /// Whether the next frame uploads every buffer's [`CONTENTS`] first: its buffers are new, or
-    /// a frame's uploads were lost ([`Self::forget`]).
-    reupload: bool,
+    /// How many kept writes this renderer's buffers hold; `None` when it can't tell (its
+    /// buffers are new, or a frame's uploads were lost: [`Self::forget`]). A frame whose queued
+    /// writes don't bring it to [`Kept::writes`] uploads every buffer as kept.
+    synced: Option<u64>,
     /// The atlas's one sampler binding; `pipeline_texture` loads integer texels itself.
     sampler: wgpu::Sampler,
     group: wgpu::BindGroup,
@@ -240,7 +276,7 @@ impl ModPipelines {
             copied: false,
             buffers: Vec::new(),
             buffer_ids: Vec::new(),
-            reupload: false,
+            synced: None,
             sampler,
             group,
             view,
@@ -482,7 +518,7 @@ impl ModPipelines {
             });
             if memory.is_none() && validation.is_none() {
                 self.buffers[slot] = made;
-                self.reupload = true;
+                self.synced = None;
             }
         }
     }
@@ -490,7 +526,7 @@ impl ModPipelines {
     /// After a frame whose uploads never reached the GPU: the next frame uploads every buffer's
     /// contents again.
     pub fn forget(&mut self) {
-        self.reupload = true;
+        self.synced = None;
     }
 
     /// Builds the pipelines of `set` unless they are built already. A required pipeline the GPU
@@ -541,6 +577,9 @@ impl ModPipelines {
             return Err(required.join("; "));
         }
         for (slot, built, error) in refused {
+            if let Some(buffers) = self.buffers.get_mut(slot) {
+                buffers.clear();
+            }
             if set.invalidate(slot) {
                 log::warn!("Horizon: {}", gpu_refusal(built, &error));
             }
@@ -569,47 +608,43 @@ impl ModPipelines {
         self.runs.clear();
         self.copied = false;
         // Before the frame's own checks: a buffer belongs to its slot, whatever load drew.
-        let mut contents = contents();
-        if std::mem::take(&mut self.reupload) {
+        let kept = contents();
+        let caught_up = self
+            .synced
+            .is_some_and(|synced| synced + batch.writes.len() as u64 == kept.writes);
+        if caught_up {
+            for write in batch.writes {
+                let buffer = self
+                    .buffers
+                    .get(write.slot as usize)
+                    .and_then(|b| b.get(write.buffer as usize));
+                let bytes = batch
+                    .bytes
+                    .get(write.bytes.start as usize..write.bytes.end as usize);
+                if let (Some(buffer), Some(bytes)) = (buffer, bytes)
+                    && u64::from(write.offset) + bytes.len() as u64 <= buffer.size()
+                {
+                    upload(buffer, u64::from(write.offset), bytes);
+                }
+            }
+        } else {
+            // Some writes never reached these buffers: every one is uploaded as kept, the
+            // frame's own writes with them.
             for (slot, buffers) in self.buffers.iter().enumerate() {
                 let Some(Some(id)) = self.buffer_ids.get(slot) else {
                     continue;
                 };
                 for (index, buffer) in (0..).zip(buffers) {
-                    if let Some(kept) = contents.get(&(id.clone(), index))
-                        && kept.len() as u64 == buffer.size()
+                    if let Some(bytes) = kept.bytes.get(&(id.clone(), index))
+                        && bytes.len() as u64 == buffer.size()
                     {
-                        upload(buffer, 0, kept);
+                        upload(buffer, 0, bytes);
                     }
                 }
             }
         }
-        for write in batch.writes {
-            let buffer = self
-                .buffers
-                .get(write.slot as usize)
-                .and_then(|b| b.get(write.buffer as usize));
-            let id = self
-                .buffer_ids
-                .get(write.slot as usize)
-                .and_then(Option::as_ref);
-            let bytes = batch
-                .bytes
-                .get(write.bytes.start as usize..write.bytes.end as usize);
-            if let (Some(buffer), Some(id), Some(bytes)) = (buffer, id, bytes)
-                && u64::from(write.offset) + bytes.len() as u64 <= buffer.size()
-            {
-                let size = buffer.size() as usize;
-                let kept = contents
-                    .entry((id.clone(), write.buffer))
-                    .or_insert_with(|| vec![0; size]);
-                kept.resize(size, 0);
-                let at = write.offset as usize;
-                kept[at..at + bytes.len()].copy_from_slice(bytes);
-                upload(buffer, u64::from(write.offset), bytes);
-            }
-        }
-        drop(contents);
+        self.synced = Some(kept.writes);
+        drop(kept);
         if batch
             .set
             .is_none_or(|set| set.generation() != self.generation)
@@ -1865,6 +1900,7 @@ mod tests {
 }";
         // An id of its own: what was written is kept by pipeline id, for the whole process.
         let id = Identifier::parse("test:written").unwrap();
+        let kept_id = id.clone();
         let registered = [RenderPipeline::new(
             id.clone(),
             id,
@@ -1893,6 +1929,11 @@ mod tests {
                     set: &Pipelines,
                     writes: &[PipelineBufferWrite],
                     bytes: &[u8]| {
+            // As the game does: each write is kept as it is queued.
+            for write in writes {
+                let at = write.bytes.start as usize..write.bytes.end as usize;
+                keep_write(&kept_id, write.buffer, 32, write.offset, &bytes[at]);
+            }
             let batch = Batch {
                 set: Some(set),
                 vertices: &vertices,
@@ -1925,6 +1966,20 @@ mod tests {
             "kept from the last frame",
         );
         assert_near(bottom, [0.0, 0.0, 255.0, 255.0], 0.0, "written over");
+
+        // A frame that returned before preparing: its write was kept, never queued to a frame.
+        keep_write(&kept_id, 0, 32, 0, bytemuck::cast_slice(&[green]));
+        let (top, bottom) = draw(&mut primitives, &first, &[], &[]);
+        assert_near(
+            top,
+            [0.0, 255.0, 0.0, 255.0],
+            0.0,
+            "a write of a skipped frame",
+        );
+        assert_near(bottom, [0.0, 0.0, 255.0, 255.0], 0.0, "the rest as it was");
+        keep_write(&kept_id, 0, 32, 0, bytemuck::cast_slice(&[red]));
+        let (top, _) = draw(&mut primitives, &first, &[], &[]);
+        assert_near(top, [255.0, 0.0, 0.0, 255.0], 0.0, "written back");
 
         // A frame given up: its uploads never reached the buffer.
         gpu.1
