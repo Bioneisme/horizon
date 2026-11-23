@@ -205,8 +205,11 @@ The depth is the opaque world only: solid and cutout terrain, as the frame holds
 (`AfterOpaqueBlocks`). The game copies it once a frame at that point, and only when a pipeline that
 reads it has quads queued. Pipeline quads at `AfterSky` read sky everywhere; from
 `AfterOpaqueBlocks` on, every stage reads the same copy, so neither translucent terrain, entities,
-particles nor a pipeline's own quads are in it. Under a shader pack that draws the terrain itself,
-there is no such point in the frame and the depth reads as sky.
+particles nor pipeline quads from `AfterOpaqueBlocks` on are in it. The one exception is a pipeline
+that [writes depth](#writing-depth) at `AfterSky`: what it wrote is part of the world's depth before
+the terrain draws, so the copy holds it. Under a shader pack that draws the terrain itself, there is
+no such point in the frame and the depth reads as sky. On a frame where the GPU has no room for the
+copy, the depth also reads as sky everywhere, and the game tries again on the next frame.
 
 The depth is read at the fragment's own pixel, at the world's draw resolution, and the position
 and distance come from the same jittered projection the world is drawn with, so a traced surface

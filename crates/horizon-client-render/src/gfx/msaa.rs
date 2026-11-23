@@ -245,7 +245,8 @@ impl Passes {
         let float = wgpu::TextureSampleType::Float { filterable: false };
         let seed_layout = kept.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MSAA sky input"),
-            entries: &[texture(0, float, false)],
+            // The sky's colour and the world's depth: as the resolve's, an unfilterable float view.
+            entries: &[texture(0, float, false), texture(1, float, false)],
         });
         let resolve_layout = kept.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MSAA resolve inputs"),
@@ -426,21 +427,29 @@ impl Passes {
         }
     }
 
-    /// Every sample starts as the sky already drawn in `color`, at the far depth.
+    /// Every sample starts as the world pass left `color` and `depth`: the sky at the far depth,
+    /// and whatever a mod pipeline drew and wrote depth for at `AfterSky` (#19057).
     pub(super) fn seed(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
     ) {
         let t = self.targets.as_ref().expect("MSAA targets fitted");
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MSAA sky input"),
             layout: &self.seed_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(color),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+            ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Seed terrain MSAA"),

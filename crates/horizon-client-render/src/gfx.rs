@@ -10573,7 +10573,7 @@ impl Renderer {
             };
             if let Some(msaa) = msaa {
                 drop(pass);
-                msaa.seed(&self.device, &mut encoder, world_view);
+                msaa.seed(&self.device, &mut encoder, world_view, world_depth);
                 let mut multisampled = msaa.begin(&mut encoder).forget_lifetime();
                 multisampled.set_bind_group(0, &self.group, &[]);
                 pack_frame(&mut multisampled);
