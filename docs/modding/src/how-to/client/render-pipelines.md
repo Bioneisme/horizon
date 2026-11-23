@@ -28,6 +28,7 @@ The game puts this before your file:
 | `input.front_facing` | `bool` | Whether this is the quad's front: its corners run top left, bottom left, bottom right, top right as seen. |
 | `frame.time` | `f32` | Seconds of game time, smooth between ticks, wrapping to 0 every hour. |
 | `frame.viewport` | `vec2<f32>` | The world picture's size in pixels. |
+| `frame.eye` | `vec3<f32>` | Where the view's rays start, in blocks relative to the camera: the camera, moved a little by the view bob. A fragment's ray runs from here through `input.position`. |
 
 The function reads and returns linear light: 1.0 is paper white, and more is brighter where the frame can hold it. The
 alpha you return is coverage. The game supplies the vertex stage, the bindings and the conversion
@@ -191,12 +192,12 @@ The shader then has three more functions, each reading the scene behind the frag
 | --- | --- |
 | `pipeline_scene_depth(input)` | The depth buffer's value there: reversed, so nearer is greater, and `0.0` where nothing opaque is (the sky). |
 | `pipeline_scene_position(input)` | The opaque surface there, in blocks relative to the camera. Over the sky, the point where the view's depth range ends. |
-| `pipeline_scene_distance(input)` | How far that surface is along the fragment's ray, in blocks, and `3.0e38` over the sky. |
+| `pipeline_scene_distance(input)` | How far that surface is along the fragment's ray from `frame.eye`, in blocks, and `3.0e38` over the sky. |
 
 ```wgsl
 fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
     // How much of the ray through this fragment runs before the terrain stops it.
-    let to_terrain = pipeline_scene_distance(input) - length(input.position);
+    let to_terrain = pipeline_scene_distance(input) - distance(input.position, frame.eye);
     return vec4(input.color.rgb, input.color.a * clamp(to_terrain / 8.0, 0.0, 1.0));
 }
 ```
