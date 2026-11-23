@@ -72,6 +72,21 @@ struct FrameUniform {
     viewport: [f32; 2],
     time: f32,
     _pad: f32,
+    /// `PipelineFrame.eye`, at a `vec3`'s alignment.
+    eye: [f32; 3],
+    _pad_eye: f32,
+}
+
+/// Where the rays of the view `view_proj` start, in blocks relative to the camera: the camera,
+/// but for a translation the projection carries (the view bob's). A projection maps that point
+/// to `w` = 0, so it is the inverse's image of the direction along depth.
+fn view_eye(view_proj: Mat4) -> [f32; 3] {
+    let eye = view_proj.inverse() * glam::Vec4::Z;
+    if eye.w.abs() > f32::EPSILON && eye.is_finite() {
+        (eye.truncate() / eye.w).to_array()
+    } else {
+        [0.0; 3]
+    }
 }
 
 /// A run as uploaded: where its quads start in the vertex buffer.
@@ -748,6 +763,8 @@ impl ModPipelines {
                 viewport: [viewport[0] as f32, viewport[1] as f32],
                 time: batch.time,
                 _pad: 0.0,
+                eye: view_eye(view_proj),
+                _pad_eye: 0.0,
             }),
         );
         quads
@@ -1028,8 +1045,14 @@ mod tests {
         .unwrap()
     }
 
+    thread_local! {
+        /// A translation the projection carries, as the view bob's: its rays start there,
+        /// off the camera.
+        static BOB: std::cell::Cell<Vec3> = const { std::cell::Cell::new(Vec3::ZERO) };
+    }
+
     fn view_proj() -> Mat4 {
-        crate::gfx::world_projection(70.0, 1.0, 512.0)
+        crate::gfx::world_projection(70.0, 1.0, 512.0) * Mat4::from_translation(BOB.get())
     }
 
     /// A quad facing the camera `z` blocks ahead of it, over the pixels `x0..x1`, `y0..y1` of
@@ -1720,6 +1743,37 @@ mod tests {
 
         let at = render_over(&gpu, &mut primitives, format, batch, STAGES - 1, 0.0);
         assert_near(at(32, 48), sky, 0.002, "nothing opaque: the sky");
+
+        // A bobbed view's rays start off the camera: the distance runs from where they start.
+        BOB.set(Vec3::new(1.5, 1.0, 0.0));
+        let bobbed = [
+            quad([0.0, 0.0, 64.0, 32.0], 2.0, [255; 4]),
+            quad([0.0, 32.0, 64.0, 64.0], 2.0, [255; 4]),
+        ]
+        .concat();
+        let at = render(
+            &gpu,
+            &mut primitives,
+            format,
+            Batch {
+                vertices: &bobbed,
+                ..batch
+            },
+            STAGES - 1,
+        );
+        let eye = Vec3::new(-1.5, -1.0, 0.0);
+        for (x, y) in [(32, 48), (0, 63), (63, 32)] {
+            let along = behind(x, y).distance(eye);
+            assert_near(
+                at(x, y),
+                [stored(along / 10.0), 0.0, stored(0.5), 1.0],
+                0.003,
+                &format!(
+                    "the wall behind ({x}, {y}) in a bobbed view, {along} blocks along its ray"
+                ),
+            );
+        }
+        BOB.set(Vec3::ZERO);
 
         let early = [run(0), run(0)];
         let batch = Batch {
