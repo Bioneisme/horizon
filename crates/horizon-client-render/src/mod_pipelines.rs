@@ -48,6 +48,9 @@ struct PipelineFrame {
     viewport: vec2<f32>,
     // Seconds of game time, smooth between ticks, wrapping to 0 every hour.
     time: f32,
+    // Where the view's rays start, in blocks relative to the camera: the camera, moved by the
+    // view bob. A fragment's ray runs from here through its position.
+    eye: vec3<f32>,
 }
 @group(0) @binding(0) var<uniform> horizon_pipeline_view: mat4x4<f32>;
 @group(0) @binding(1) var<uniform> frame: PipelineFrame;
@@ -101,7 +104,7 @@ fn pipeline_scene_distance(input: PipelineInput) -> f32 {
     if pipeline_scene_depth(input) <= 0.0 {
         return 3.0e38;
     }
-    return length(pipeline_scene_position(input));
+    return distance(pipeline_scene_position(input), frame.eye);
 }
 ";
 
