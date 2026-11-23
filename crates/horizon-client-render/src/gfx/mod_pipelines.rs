@@ -2109,6 +2109,78 @@ mod tests {
         );
     }
 
+    /// A depth-writing pipeline that returns a position not a number or infinite draws nothing
+    /// there, and writes no depth: the quad behind it is drawn.
+    #[test]
+    fn a_depth_writing_pipeline_draws_nothing_at_a_position_not_finite() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        // NaN on the left third, +infinity in the middle, -infinity on the right; blue.
+        let surface = "fn pipeline_fragment(input: PipelineInput) -> PipelineSurface {
+    var bits = 0x7fc00000u;
+    if input.uv.x > 0.66 { bits = 0xff800000u; } else if input.uv.x > 0.33 { bits = 0x7f800000u; }
+    let odd = vec3(bitcast<f32>(bits));
+    return PipelineSurface(vec4<f32>(0.0, 0.0, 1.0, 1.0), input.position + odd);
+}";
+        let id = |name: &str| Identifier::parse(name).unwrap();
+        let registered = [
+            RenderPipeline::new(
+                id("test:odd"),
+                id("test:odd"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            )
+            .writes_depth(),
+            RenderPipeline::new(
+                id("test:plain"),
+                id("test:plain"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            ),
+        ];
+        let set = Pipelines::build(&registered, 5, |file| {
+            Ok(if file.ends_with("odd.wgsl") {
+                surface
+            } else {
+                PASS
+            }
+            .to_owned())
+        })
+        .unwrap();
+        let vertices = [
+            quad([0.0, 0.0, 64.0, 64.0], 2.0, [255; 4]),
+            quad([0.0, 0.0, 64.0, 64.0], 4.0, [255, 0, 0, 255]),
+        ]
+        .concat();
+        let runs = [
+            PipelineRun {
+                slot: 0,
+                stage: 4,
+                quads: 1,
+            },
+            PipelineRun {
+                slot: 1,
+                stage: 4,
+                quads: 1,
+            },
+        ];
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            ..Default::default()
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        for (x, what) in [(10, "NaN"), (32, "+infinity"), (53, "-infinity")] {
+            assert_near(at(x, 32), [255.0, 0.0, 0.0, 255.0], 0.0, what);
+        }
+    }
+
     /// A pipeline whose buffers the device has no room for is refused as the GPU refuses a
     /// shader: an optional one resolves invalid and the others build.
     #[test]
