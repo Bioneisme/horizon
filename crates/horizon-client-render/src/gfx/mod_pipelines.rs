@@ -2272,11 +2272,13 @@ mod tests {
                 slot: 0,
                 stage: 4,
                 quads: 1,
+                screen: false,
             },
             PipelineRun {
                 slot: 1,
                 stage: 4,
                 quads: 1,
+                screen: false,
             },
         ];
         let batch = Batch {
@@ -2409,9 +2411,9 @@ mod tests {
     }
 
     /// A screen draw covers every pixel of the view, in front of the wall 5 blocks ahead though
-    /// it tests depth, and hands each pixel the ray through its centre: `normalize(position)`
-    /// is the ray's direction, the scene distance is the wall's along it, and `uv` runs 0 to 1
-    /// from the top left.
+    /// it tests depth, and hands each pixel the ray through its centre: `position - frame.eye`
+    /// is the ray's direction, in a bobbed view too, the scene distance is the wall's along it,
+    /// and `uv` runs 0 to 1 from the top left.
     #[test]
     fn a_screen_draw_covers_the_view_and_hands_each_pixel_its_ray() {
         let _gpu = crate::gfx::test_gpu::lock();
@@ -2422,7 +2424,7 @@ mod tests {
         // Red and green: the ray's x and y from -1 to 1 as 0 to 1; blue: the scene distance in
         // tens of blocks.
         let ray = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
-    let ray = normalize(input.position);
+    let ray = normalize(input.position - frame.eye);
     return vec4<f32>(ray.xy * 0.5 + 0.5, pipeline_scene_distance(input) / 10.0, 1.0);
 }";
         let uv = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
@@ -2467,34 +2469,38 @@ mod tests {
             render(&gpu, &mut primitives, format, batch, STAGES - 1)
         };
 
-        let at = drawn(0);
-        let inverse = view_proj().inverse();
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let wall = inverse.project_point3(Vec3::new(
-                    (x as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0,
-                    1.0 - (y as f32 + 0.5) / SIZE as f32 * 2.0,
-                    wall(),
-                ));
-                let ray = wall.normalize();
-                assert_near(
-                    at(x, y),
-                    [
-                        stored(ray.x * 0.5 + 0.5),
-                        stored(ray.y * 0.5 + 0.5),
-                        stored(wall.length() / 10.0),
-                        1.0,
-                    ],
-                    0.004,
-                    &format!("pixel ({x}, {y}), its ray {ray}"),
-                );
+        // The view bob's translation rides in the projection: its rays start off the camera.
+        for bob in [Vec3::ZERO, Vec3::new(1.5, 1.0, 0.0)] {
+            BOB.set(bob);
+            let at = drawn(0);
+            let inverse = view_proj().inverse();
+            let eye = -bob;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let wall = inverse.project_point3(Vec3::new(
+                        (x as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0,
+                        1.0 - (y as f32 + 0.5) / SIZE as f32 * 2.0,
+                        wall(),
+                    ));
+                    let ray = (wall - eye).normalize();
+                    assert_near(
+                        at(x, y),
+                        [
+                            stored(ray.x * 0.5 + 0.5),
+                            stored(ray.y * 0.5 + 0.5),
+                            stored(wall.distance(eye) / 10.0),
+                            1.0,
+                        ],
+                        0.004,
+                        &format!("pixel ({x}, {y}) with the bob {bob}, its ray {ray}"),
+                    );
+                }
             }
+            // The centre looks straight ahead.
+            let centre = (inverse.project_point3(Vec3::new(0.0, 0.0, wall())) - eye).normalize();
+            assert!(centre.abs_diff_eq(Vec3::NEG_Z, 1e-5), "{centre}");
         }
-        // The centre looks straight ahead.
-        let centre = inverse
-            .project_point3(Vec3::new(0.0, 0.0, wall()))
-            .normalize();
-        assert!(centre.abs_diff_eq(Vec3::NEG_Z, 1e-5), "{centre}");
+        BOB.set(Vec3::ZERO);
 
         let at = drawn(1);
         let half = 0.5 / SIZE as f32;

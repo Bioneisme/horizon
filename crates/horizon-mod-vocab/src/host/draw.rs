@@ -483,7 +483,8 @@ pub trait WorldDrawContext {
     /// them itself, at `pipeline_scene_distance` when its pipeline
     /// [reads the scene depth](crate::RenderPipeline::reads_scene_depth). Its shader gets
     /// `position`, a point on the pixel's ray just past the near plane
-    /// (`normalize(input.position)` is the ray), `uv` from 0 to 1 from the top left and white.
+    /// (`normalize(input.position - frame.eye)` is the ray), `uv` from 0 to 1 from the top left
+    /// and white.
     /// On `Err`, nothing is drawn.
     fn pipeline_screen(&mut self, pipeline: RenderPipelineRef) -> Result<(), PipelineDrawError> {
         unimplemented!("WorldDrawContext::pipeline_screen")

@@ -129,22 +129,25 @@ event.draw.pipeline_screen(clouds)?;
 ```
 
 It draws at the current stage, in the order submitted among that stage's pipeline quads, and
-counts as one quad of the view's 4,096. The quad lies on the view's near plane: the far plane never cuts it,
-however far the shader reaches, and it passes `WorldDepth::Tested`'s test everywhere, so the shader
-decides where the world stops it. Its `pipeline_fragment` gets:
+counts as one quad of the view's 4,096. The quad lies just past the view's near plane: the far plane never
+cuts it, however far the shader reaches, and it is in front of everything the world draws, so it passes
+`WorldDepth::Tested`'s test and the shader decides where the world stops it. Only a depth-writing
+pipeline's surface nearer than that, within a thousandth of the near plane's 0.05 blocks, would
+hide it; a pipeline registered `WorldDepth::ThroughWalls` draws over every pixel. Its
+`pipeline_fragment` gets:
 
 | Field | Value |
 | --- | --- |
-| `position` | A point on the pixel's ray just past the near plane, in blocks relative to the camera: `normalize(input.position)` is the ray's direction. |
+| `position` | A point on the pixel's ray just past the near plane, in blocks relative to the camera: `normalize(input.position - frame.eye)` is the ray's direction. |
 | `uv` | 0 to 1 across the view, from the top left. |
 | `color` | White. |
 | `pixel`, `screen` | As for a quad. |
 
 ```wgsl
 fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
-    let ray = normalize(input.position);
+    let ray = normalize(input.position - frame.eye);
     // A cloud layer at 6000 blocks up, stopped by the terrain in front of it.
-    let along = (6000.0 - camera_height) / ray.y; // the mod's own camera height, from a buffer
+    let along = (6000.0 - camera_height - frame.eye.y) / ray.y; // the mod's own camera height, from a buffer
     if ray.y <= 0.0 || along > pipeline_scene_distance(input) {
         discard;
     }
