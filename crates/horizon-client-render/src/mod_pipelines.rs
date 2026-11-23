@@ -674,6 +674,54 @@ fn signature(module: &naga::Module, depth_write: bool) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The composed shader's resource bindings as naga reads them: group, binding, name and
+    /// address space.
+    fn bindings(shader: &str) -> Vec<(u32, u32, String, naga::AddressSpace)> {
+        let module = naga::front::wgsl::parse_str(shader).unwrap();
+        module
+            .global_variables
+            .iter()
+            .filter_map(|(_, global)| {
+                let at = global.binding.as_ref()?;
+                Some((at.group, at.binding, global.name.clone()?, global.space))
+            })
+            .collect()
+    }
+
+    /// Whether the composed shader binds anything in `group`.
+    fn binds_group(shader: &str, group: u32) -> bool {
+        bindings(shader).iter().any(|(g, ..)| *g == group)
+    }
+
+    /// Whether the composed shader's fragment stage writes the fragment's depth.
+    fn writes_frag_depth(shader: &str) -> bool {
+        let module = naga::front::wgsl::parse_str(shader).unwrap();
+        let frag_depth = |binding: &Option<naga::Binding>| {
+            matches!(
+                binding,
+                Some(naga::Binding::BuiltIn(naga::BuiltIn::FragDepth))
+            )
+        };
+        module
+            .entry_points
+            .iter()
+            .filter(|entry| entry.stage == naga::ShaderStage::Fragment)
+            .filter_map(|entry| entry.function.result.as_ref())
+            .any(|result| {
+                frag_depth(&result.binding)
+                    || matches!(&module.types[result.ty].inner,
+                        naga::TypeInner::Struct { members, .. }
+                            if members.iter().any(|m| frag_depth(&m.binding)))
+            })
+    }
+
+    /// Whether the composed shader binds `name` at `group` and `binding`.
+    fn binds(shader: &str, group: u32, binding: u32, name: &str) -> bool {
+        bindings(shader)
+            .iter()
+            .any(|(g, b, n, _)| (*g, *b, n.as_str()) == (group, binding, name))
+    }
+
     #[test]
     fn fragment_cannot_read_vertex_uniform() {
         assert!(compose("fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return horizon_pipeline_view * input.color; }").unwrap_err().contains("horizon_pipeline_view"));
@@ -877,7 +925,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
     fn only_a_textured_pipeline_samples_and_neither_binds_its_own() {
         let sample = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * input.color; }";
         let shader = compose_with(sample, TEXTURED).unwrap();
-        assert!(shader.contains("@group(2) @binding(0) var horizon_pipeline_texture"));
+        assert!(binds(&shader, 2, 0, "horizon_pipeline_texture"));
         assert!(
             compose(sample)
                 .unwrap_err()
@@ -891,7 +939,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
                 .contains("declares a binding")
         );
         // Untextured pipelines compose as before: no group 2.
-        assert!(!compose(GLOW).unwrap().contains("@group(2)"));
+        assert!(!binds_group(&compose(GLOW).unwrap(), 2));
     }
 
     const DEPTH: &str = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> {
@@ -910,13 +958,17 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
     #[test]
     fn only_a_depth_reading_pipeline_reads_the_scene_depth() {
         let shader = compose_with(DEPTH, READS_DEPTH).unwrap();
-        assert!(shader.contains("var horizon_pipeline_scene_depth: texture_depth_2d"));
+        assert!(
+            bindings(&shader)
+                .iter()
+                .any(|(group, _, name, _)| *group == 1 && name == "horizon_pipeline_scene_depth")
+        );
         assert!(
             compose(DEPTH)
                 .unwrap_err()
                 .contains("RenderPipeline::reads_scene_depth")
         );
-        assert!(!compose(GLOW).unwrap().contains("@group(1)"));
+        assert!(!binds_group(&compose(GLOW).unwrap(), 1));
         let both = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * pipeline_scene_depth(input); }";
         let textured_and_depth = Features {
             textured: true,
@@ -959,7 +1011,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
             ..Features::default()
         };
         let shader = compose_with(surface, writes).unwrap();
-        assert!(shader.contains("@builtin(frag_depth)"));
+        assert!(writes_frag_depth(&shader));
         assert!(
             compose(surface)
                 .unwrap_err()
@@ -972,7 +1024,7 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
                 .unwrap_err()
                 .contains("PipelineSurface")
         );
-        assert!(!compose(GLOW).unwrap().contains("frag_depth"));
+        assert!(!writes_frag_depth(&compose(GLOW).unwrap()));
 
         let registered = [pipeline("example:surface", "example:surface").writes_depth()];
         let set = Pipelines::build(&registered, 1, |_| Ok(surface.to_owned())).unwrap();
@@ -1000,12 +1052,16 @@ fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_textur
             },
         )
         .unwrap();
-        assert!(
-            shader.contains("@group(2) @binding(3) var<storage, read> blasts: array<vec4<f32>>;")
-        );
-        assert!(
-            shader.contains("@group(2) @binding(4) var<storage, read> grid: array<vec4<f32>>;")
-        );
+        let read = naga::AddressSpace::Storage {
+            access: naga::StorageAccess::LOAD,
+        };
+        let found = bindings(&shader);
+        for (binding, name) in [(3, "blasts"), (4, "grid")] {
+            assert!(
+                found.contains(&(2, binding, name.to_owned(), read)),
+                "{name} at 2, {binding}: {found:?}"
+            );
+        }
         assert!(compose(reads).unwrap_err().contains("blasts"));
         let textured = "fn pipeline_fragment(input: PipelineInput) -> vec4<f32> { return pipeline_texture(input.uv) * blasts[0]; }";
         let both = Features {
