@@ -117,6 +117,10 @@ pub fn keep_write(
     offset: u32,
     bytes: &[u8],
 ) {
+    // The game queues no empty write, so keeping one would read as a write the renderer missed.
+    if bytes.is_empty() {
+        return;
+    }
     let mut kept = contents();
     let at = offset as usize;
     let Some(end) = at
@@ -1980,6 +1984,14 @@ mod tests {
         keep_write(&kept_id, 0, 32, 0, bytemuck::cast_slice(&[red]));
         let (top, _) = draw(&mut primitives, &first, &[], &[]);
         assert_near(top, [255.0, 0.0, 0.0, 255.0], 0.0, "written back");
+
+        // An empty write is accepted and never queued: no frame missed it, so none uploads every
+        // buffer again (the GPU's copy, cleared behind the renderer's back, stays cleared).
+        keep_write(&kept_id, 0, 32, 0, &[]);
+        gpu.1
+            .write_buffer(&primitives.pipelines.buffers[0][0], 0, &[0; 32]);
+        let (top, _) = draw(&mut primitives, &first, &[], &[]);
+        assert!(top[0] < 128.0, "uploaded again for an empty write: {top:?}");
 
         // A frame given up: its uploads never reached the buffer.
         gpu.1
