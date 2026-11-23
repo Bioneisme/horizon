@@ -73,18 +73,6 @@ struct FrameUniform {
     _pad_eye: f32,
 }
 
-/// Where the rays of the view `view_proj` start, in blocks relative to the camera: the camera,
-/// but for a translation the projection carries (the view bob's). A projection maps that point
-/// to `w` = 0, so it is the inverse's image of the direction along depth.
-fn view_eye(view_proj: Mat4) -> [f32; 3] {
-    let eye = view_proj.inverse() * glam::Vec4::Z;
-    if eye.w.abs() > f32::EPSILON && eye.is_finite() {
-        (eye.truncate() / eye.w).to_array()
-    } else {
-        [0.0; 3]
-    }
-}
-
 /// A run as uploaded: where its quads start in the vertex buffer.
 struct Run {
     slot: usize,
@@ -717,7 +705,10 @@ impl ModPipelines {
                 viewport: [viewport[0] as f32, viewport[1] as f32],
                 time: batch.time,
                 _pad: 0.0,
-                eye: view_eye(view_proj),
+                // Where its rays start: the camera, moved by the view bob the projection carries.
+                eye: super::view::projection_center(view_proj)
+                    .unwrap_or(glam::Vec3::ZERO)
+                    .to_array(),
                 _pad_eye: 0.0,
             }),
         );
