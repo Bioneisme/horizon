@@ -137,6 +137,10 @@ pub fn keep_write(
     offset: u32,
     bytes: &[u8],
 ) {
+    // The game queues no empty write, so keeping one would read as a write the renderer missed.
+    if bytes.is_empty() {
+        return;
+    }
     let mut kept = contents();
     let at = offset as usize;
     let Some(end) = at
@@ -2039,6 +2043,14 @@ mod tests {
         let (top, _) = draw(&mut primitives, &first, &[], &[]);
         assert_near(top, [255.0, 0.0, 0.0, 255.0], 0.0, "written back");
 
+        // An empty write is accepted and never queued: no frame missed it, so none uploads every
+        // buffer again (the GPU's copy, cleared behind the renderer's back, stays cleared).
+        keep_write(&kept_id, 0, 32, 0, &[]);
+        gpu.1
+            .write_buffer(&primitives.pipelines.buffers[0][0], 0, &[0; 32]);
+        let (top, _) = draw(&mut primitives, &first, &[], &[]);
+        assert!(top[0] < 128.0, "uploaded again for an empty write: {top:?}");
+
         // A frame given up: its uploads never reached the buffer.
         gpu.1
             .write_buffer(&primitives.pipelines.buffers[0][0], 0, &[0; 32]);
@@ -2153,6 +2165,78 @@ mod tests {
             0.0,
             "a tenth of a block in front of it: drawn",
         );
+    }
+
+    /// A depth-writing pipeline that returns a position not a number or infinite draws nothing
+    /// there, and writes no depth: the quad behind it is drawn.
+    #[test]
+    fn a_depth_writing_pipeline_draws_nothing_at_a_position_not_finite() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(gpu) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        // NaN on the left third, +infinity in the middle, -infinity on the right; blue.
+        let surface = "fn pipeline_fragment(input: PipelineInput) -> PipelineSurface {
+    var bits = 0x7fc00000u;
+    if input.uv.x > 0.66 { bits = 0xff800000u; } else if input.uv.x > 0.33 { bits = 0x7f800000u; }
+    let odd = vec3(bitcast<f32>(bits));
+    return PipelineSurface(vec4<f32>(0.0, 0.0, 1.0, 1.0), input.position + odd);
+}";
+        let id = |name: &str| Identifier::parse(name).unwrap();
+        let registered = [
+            RenderPipeline::new(
+                id("test:odd"),
+                id("test:odd"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            )
+            .writes_depth(),
+            RenderPipeline::new(
+                id("test:plain"),
+                id("test:plain"),
+                PipelineBlend::Translucent,
+                WorldDepth::Tested,
+            ),
+        ];
+        let set = Pipelines::build(&registered, 5, |file| {
+            Ok(if file.ends_with("odd.wgsl") {
+                surface
+            } else {
+                PASS
+            }
+            .to_owned())
+        })
+        .unwrap();
+        let vertices = [
+            quad([0.0, 0.0, 64.0, 64.0], 2.0, [255; 4]),
+            quad([0.0, 0.0, 64.0, 64.0], 4.0, [255, 0, 0, 255]),
+        ]
+        .concat();
+        let runs = [
+            PipelineRun {
+                slot: 0,
+                stage: 4,
+                quads: 1,
+            },
+            PipelineRun {
+                slot: 1,
+                stage: 4,
+                quads: 1,
+            },
+        ];
+        let batch = Batch {
+            set: Some(&set),
+            vertices: &vertices,
+            runs: &runs,
+            ..Default::default()
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut primitives = WorldPrimitives::new(&gpu.0, (format, false));
+        let at = render(&gpu, &mut primitives, format, batch, STAGES - 1);
+        for (x, what) in [(10, "NaN"), (32, "+infinity"), (53, "-infinity")] {
+            assert_near(at(x, 32), [255.0, 0.0, 0.0, 255.0], 0.0, what);
+        }
     }
 
     /// A pipeline whose buffers the device has no room for is refused as the GPU refuses a

@@ -13,8 +13,16 @@ override LINEAR: bool = false;
 }
 
 @group(0) @binding(0) var seed_color: texture_2d<f32>;
-@fragment fn seed(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    return textureLoad(seed_color, vec2<i32>(p.xy), 0);
+// The world pass's depth: the far depth under the sky, nearer where a mod pipeline wrote depth
+// at AfterSky, which the terrain's samples must keep in front of what lies behind it.
+@group(0) @binding(1) var seed_depth: texture_2d<f32>;
+struct Seed {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+@fragment fn seed(@builtin(position) p: vec4<f32>) -> Seed {
+    let at = vec2<i32>(p.xy);
+    return Seed(textureLoad(seed_color, at, 0), textureLoad(seed_depth, at, 0).r);
 }
 
 @group(1) @binding(0) var samples: texture_multisampled_2d<f32>;

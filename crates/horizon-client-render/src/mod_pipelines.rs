@@ -175,16 +175,28 @@ struct HorizonPipelineOutput {
 @fragment fn horizon_fs_pipeline(in: HorizonPipelineVertex, @builtin(front_facing) front: bool)
     -> HorizonPipelineOutput {
     let surface = pipeline_fragment(horizon_pipeline_input(in, front));
+    // Not a number or infinite: nothing. Told by the bits, before any arithmetic, since WGSL
+    // lets a compiler assume floats are finite and fold away a comparison that would catch NaN.
+    if !horizon_finite(vec4<f32>(surface.position, 1.0)) {
+        discard;
+    }
     let clip = horizon_pipeline_view * vec4<f32>(surface.position, 1.0);
+    if !horizon_finite(clip) || !(clip.w > 0.0) {
+        discard;
+    }
     let depth = clip.z / clip.w;
-    // Behind the camera, past the near plane or not a number: nothing (NaN fails every test).
-    if !(clip.w > 0.0) || !(depth >= 0.0) || !(depth <= 1.0) {
+    // Behind the camera or past the near plane: nothing.
+    if !(depth >= 0.0) || !(depth <= 1.0) {
         discard;
     }
     var out: HorizonPipelineOutput;
     out.color = horizon_pipeline_color(surface.color);
     out.depth = depth;
     return out;
+}
+// Whether no component is infinite or not a number: its exponent is not all ones.
+fn horizon_finite(v: vec4<f32>) -> bool {
+    return all((bitcast<vec4<u32>>(v) & vec4(0x7f800000u)) != vec4(0x7f800000u));
 }
 ";
 

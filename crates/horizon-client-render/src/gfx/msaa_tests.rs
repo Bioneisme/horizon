@@ -231,7 +231,7 @@ struct Color {
             });
         }
         assert!(passes.fit(&device, [8, height], surface));
-        passes.seed(&device, &mut encoder, &color_view);
+        passes.seed(&device, &mut encoder, &color_view, &depth_view);
         {
             let mut pass = passes.begin(&mut encoder);
             pass.set_pipeline(&pipeline);
@@ -346,5 +346,104 @@ struct Color {
     assert!(
         kept_by.iter().all(|&n| n > 0),
         "edges kept by each: {kept_by:?}"
+    );
+}
+
+/// The samples start at the depth the world pass already holds, not the far depth: a mod
+/// pipeline's depth written at `AfterSky` (#19057) survives the terrain's samples and their
+/// resolve, and terrain behind it is hidden.
+#[test]
+fn the_seed_keeps_the_depth_drawn_before_it() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    let instance = crate::gfx::test_gpu::instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba16Float;
+    if !supported(&adapter, format) {
+        eprintln!("skipped: {:?} can't draw 4x MSAA", adapter.get_info());
+        return;
+    }
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: adapter.features()
+            & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+        ..Default::default()
+    }))
+    .unwrap();
+    let reuse = Reuse::default();
+    let kept = reuse.on(&device);
+    let mut passes = Passes::new(&kept, &device, format, false);
+    let size = wgpu::Extent3d {
+        width: 64,
+        height: 4,
+        depth_or_array_layers: 1,
+    };
+    let texture = |format| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    };
+    let (color, depth) = (texture(format), texture(wgpu::TextureFormat::Depth32Float));
+    let (color_view, depth_view) = (
+        color.create_view(&Default::default()),
+        depth.create_view(&Default::default()),
+    );
+    let mut encoder = device.create_command_encoder(&Default::default());
+    // The world pass's sky, and a depth some pipeline wrote over it.
+    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        color_attachments: &[Some(attachment(
+            &color_view,
+            wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+        ))],
+        depth_stencil_attachment: Some(depth_attachment(&depth_view, wgpu::LoadOp::Clear(0.25))),
+        ..Default::default()
+    }));
+    assert!(passes.fit(&device, [64, 4], false));
+    passes.seed(&device, &mut encoder, &color_view, &depth_view);
+    drop(passes.begin(&mut encoder));
+    passes.resolve(&mut encoder, &color_view, &depth_view, None);
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 256 * 4,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &depth,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::DepthOnly,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(4),
+            },
+        },
+        size,
+    );
+    queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    readback.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    rx.recv().unwrap().unwrap();
+    let bytes = readback.get_mapped_range(..).unwrap();
+    let depths: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&bytes).to_vec();
+    assert!(
+        depths.iter().all(|&d| d == 0.25),
+        "the resolved depth lost what was drawn before the seed: {:?}",
+        &depths[..4]
     );
 }
