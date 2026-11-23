@@ -326,12 +326,14 @@ Its `pipeline_fragment` then returns a `PipelineSurface` in place of a colour:
 
 ```wgsl
 fn pipeline_fragment(input: PipelineInput) -> PipelineSurface {
-    let ray = normalize(input.position);
-    let hit = trace(ray, pipeline_scene_distance(input)); // the mod's own: < 0 for a miss
+    // The fragment's ray, from where the view's rays start.
+    let ray = normalize(input.position - frame.eye);
+    let hit = trace(frame.eye, ray, pipeline_scene_distance(input)); // the mod's own: < 0 for a miss
     if hit < 0.0 {
         discard;
     }
-    return PipelineSurface(vec4(shade(ray * hit), 1.0), ray * hit);
+    let surface = frame.eye + ray * hit;
+    return PipelineSurface(vec4(shade(surface), 1.0), surface);
 }
 ```
 
