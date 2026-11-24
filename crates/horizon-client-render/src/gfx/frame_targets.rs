@@ -25,6 +25,8 @@ pub(crate) enum Kind {
     FrameGeneration,
     Buffers,
     SceneDepth,
+    PackAtlas,
+    Pack,
 }
 
 impl Kind {
@@ -42,6 +44,10 @@ impl Kind {
             Kind::Buffers => "a frame that needs a larger buffer is skipped",
             Kind::SceneDepth => {
                 "mod pipelines read the scene depth as sky until there is room for it"
+            }
+            Kind::PackAtlas => "no room for the shader pack's block atlas; the pack is not loaded",
+            Kind::Pack => {
+                "no room for what the shader pack draws into; frames are skipped until there is"
             }
         }
     }
@@ -75,8 +81,9 @@ pub(crate) fn in_screenshot<T>(draw: impl FnOnce() -> T) -> T {
     drawn
 }
 
-/// Whether a scaled screenshot's frame is being drawn ([`in_screenshot`]): what `made` makes then
-/// is unchecked, so a target kept past the frame is made again by the next window frame.
+/// Whether a scaled screenshot's frame is being drawn ([`in_screenshot`]), in which `made` checks
+/// nothing: what it makes is checked by the frame's own scopes, and a target kept past the frame
+/// is made again by the next window frame.
 pub(crate) fn screenshot_frame() -> bool {
     SCREENSHOT.get()
 }
@@ -217,6 +224,17 @@ impl super::Renderer {
             frame_lost(memory, validation)
         });
         let encoder = frame.encoder.filter(|_| !lost);
+        if encoder.is_none() {
+            // The dropped encoder's visibility block-table copies and staged meshlet uploads
+            // never ran on the GPU: invalidate both caches immediately in addition to flagging
+            // `frame_lost` for `upload_again` on the next frame.
+            if let Some(vis) = &mut self.visbuf {
+                vis.forget();
+            }
+            if let Some(mesh_terrain) = &mut self.mesh_terrain {
+                mesh_terrain.forget_uploads();
+            }
+        }
         self.frame_lost |= encoder.is_none();
         let mut encoder = encoder.unwrap_or_else(|| {
             self.device
